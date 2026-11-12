@@ -1,0 +1,16 @@
+name: llm-gateway
+
+services:
+  server:
+    image: ghcr.io/wherelee/llm-api-gateway:${IMAGE_TAG:-latest}
+    container_name: llm-gateway
+    network_mode: host
+    env_file:
+      - /opt/llm-gateway/server.env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s

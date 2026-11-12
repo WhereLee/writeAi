@@ -1,0 +1,7 @@
+llm-server
+llm-server-test
+bin/
+*.log
+.env
+.env.*
+!.env.example
