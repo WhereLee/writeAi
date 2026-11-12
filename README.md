@@ -22,8 +22,29 @@ npm install && npm run dev
 
 # Load test
 cd k6
-k6 run loadtest.js
+BASE_URL=http://localhost:8080 API_KEY=sk-xxx MODEL=deepseek-chat k6 run loadtest.js
 ```
+
+Frontend API address is read from `VITE_API_BASE`:
+
+```bash
+cp frontend/.env.example frontend/.env
+```
+
+## API
+
+- `POST /api/register`, `POST /api/login`
+- `GET /api/plans` (public)
+- `GET /api/balance`, `GET /api/keys`, `POST /api/keys` (JWT)
+- `GET /api/orders`, `POST /api/orders`, `POST /api/orders/{id}/pay` (JWT)
+- `POST /v1/chat/completions` (`X-API-Key`)
+- `GET /healthz`, `GET /readyz`, `GET /metrics`
+
+Order payment is a demo endpoint. It only works when
+`ALLOW_MOCK_PAYMENT=true`; keep it disabled in production.
+
+`CORS_ORIGINS` is a comma-separated allowlist. Set it to the frontend origin,
+for example `http://118.31.111.223:3000`.
 
 ## Deploy
 
