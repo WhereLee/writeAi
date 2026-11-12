@@ -1,9 +1,0 @@
-2026/11/13 01:58:59 "GET http://localhost:8080/health HTTP/1.1" from [::1]:1142 - 200 2B in 0s
-2026/11/13 01:59:07 "POST http://localhost:8080/api/register HTTP/1.1" from [::1]:4129 - 201 36B in 69.1486ms
-2026/11/13 01:59:07 "POST http://localhost:8080/api/login HTTP/1.1" from [::1]:4130 - 200 160B in 50.7108ms
-2026/11/13 01:59:07 "GET http://localhost:8080/api/balance HTTP/1.1" from [::1]:4131 - 200 26B in 1.4812ms
-2026/11/13 01:59:07 "GET http://localhost:8080/api/plans HTTP/1.1" from [::1]:4132 - 401 52B in 0s
-2026/11/13 01:59:07 "POST http://localhost:8080/api/keys HTTP/1.1" from [::1]:4133 - 201 71B in 8.0731ms
-2026/11/13 01:59:18 "POST http://localhost:8080/v1/chat/completions HTTP/1.1" from [::1]:2761 - 402 33B in 1.2511ms
-2026/11/13 01:59:18 "POST http://localhost:8080/api/login HTTP/1.1" from [::1]:2763 - 200 160B in 51.1989ms
-2026/11/13 01:59:18 "GET http://localhost:8080/api/balance HTTP/1.1" from [::1]:2764 - 200 26B in 0s

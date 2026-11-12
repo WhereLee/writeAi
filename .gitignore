@@ -8,3 +8,6 @@ backend/llm-server-test
 __pycache__
 *.pyc
 .DS_Store
+backend/server.log
+backend/server-error.log
+backend/start.bat
