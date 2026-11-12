@@ -8,6 +8,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/lrs/llm-api-gateway/internal/store"
 )
 
 var testDB *sqlx.DB
@@ -28,6 +30,9 @@ func getTestDB(t *testing.T) *sqlx.DB {
 		t.Skipf("MySQL ping failed: %v", err)
 	}
 	testDB = sqlx.NewDb(db, "mysql")
+	if err := store.Migrate(testDB); err != nil {
+		t.Fatalf("migrate test database: %v", err)
+	}
 	return testDB
 }
 
