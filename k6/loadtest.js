@@ -3,6 +3,7 @@ import { check, sleep } from "k6";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 const API_KEY = __ENV.API_KEY || "";
+const MODEL = __ENV.MODEL || "deepseek-chat";
 
 export const options = {
   scenarios: {
@@ -25,14 +26,12 @@ export const options = {
 };
 
 export default function () {
-  // Health check
-  const health = http.get(`${BASE_URL}/health`);
+  const health = http.get(`${BASE_URL}/healthz`);
   check(health, { "health 200": r => r.status === 200 });
 
   if (API_KEY) {
-    // Gateway request
     const payload = JSON.stringify({
-      model: "gpt-3.5-turbo",
+      model: MODEL,
       messages: [{ role: "user", content: "Say hello in 5 words" }],
     });
     const headers = { "Content-Type": "application/json", "X-API-Key": API_KEY };
@@ -41,7 +40,6 @@ export default function () {
       "gateway status is 200 or 429": r => r.status === 200 || r.status === 429,
     });
   } else {
-    // Register + login simulation (no upstream key needed)
     const username = `loadtest_${__VU}_${__ITER}`;
     const reg = http.post(`${BASE_URL}/api/register`,
       JSON.stringify({ username, password: "testpass123" }),
