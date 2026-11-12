@@ -56,21 +56,25 @@ func main() {
 	billingEngine := billing.NewEngine(rdb, db, log)
 	upstreamClient := upstream.NewClient(cfg.UpstreamURL, cfg.UpstreamKey, log)
 	rateLimiter := middleware.NewRateLimiter(rdb)
-	h := handler.NewHandler(db, billingEngine, upstreamClient, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin)
+	h := handler.NewHandler(db, billingEngine, upstreamClient, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin, cfg.AllowMockPayment)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.Recoverer)
+	r.Use(middleware.CORS(cfg.CORSOrigins))
 	r.Use(chimw.Timeout(35 * time.Second))
 
 	r.Post("/api/register", h.Register)
 	r.Post("/api/login", h.Login)
+	r.Get("/api/plans", h.ListPlans)
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.JWTAuth(cfg.JWTSecret))
 		r.Get("/api/keys", h.ListAPIKeys)
 		r.Post("/api/keys", h.CreateAPIKey)
 		r.Get("/api/balance", h.GetBalance)
-		r.Get("/api/plans", h.ListPlans)
+		r.Get("/api/orders", h.ListOrders)
+		r.Post("/api/orders", h.CreateOrder)
+		r.Post("/api/orders/{id}/pay", h.PayOrder)
 	})
 	r.Post("/v1/chat/completions", h.Gateway)
 
@@ -142,4 +146,3 @@ func getUserIDsFromRedis(ctx context.Context, rdb *redis.Client) []int64 {
 	}
 	return ids
 }
-

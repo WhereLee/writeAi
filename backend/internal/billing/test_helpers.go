@@ -24,16 +24,23 @@ func getTestDB(t *testing.T) *sqlx.DB {
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		t.Skip("MySQL not available for testing")
+		skipOrFail(t, "MySQL not available for testing: %v", err)
 	}
 	if err := db.Ping(); err != nil {
-		t.Skipf("MySQL ping failed: %v", err)
+		skipOrFail(t, "MySQL ping failed: %v", err)
 	}
 	testDB = sqlx.NewDb(db, "mysql")
 	if err := store.Migrate(testDB); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return testDB
+}
+
+func skipOrFail(t *testing.T, format string, args ...interface{}) {
+	if os.Getenv("REQUIRE_TEST_DB") == "true" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
 }
 
 func newTestRedisClient(addr string) *redis.Client {

@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/jmoiron/sqlx"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,10 +26,10 @@ type Engine struct {
 }
 
 type CompensateItem struct {
-	UserID  int64
-	Amount  int64
-	Model   string
-	Reason  string // refund, settle
+	UserID int64
+	Amount int64
+	Model  string
+	Reason string // refund, settle
 }
 
 func NewEngine(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger) *Engine {
@@ -86,7 +86,13 @@ func (e *Engine) CheckBalance(ctx context.Context, userID int64) (int64, error) 
 		if err != nil {
 			return 0, err
 		}
-		e.rdb.Set(ctx, key, balance, 0)
+		ok, err := e.rdb.SetNX(ctx, key, balance, 0).Result()
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return e.rdb.Get(ctx, key).Int64()
+		}
 		return balance, nil
 	}
 	return bal, err
@@ -103,29 +109,25 @@ var reserveScript = redis.NewScript(`
 	return bal - tonumber(ARGV[1])
 `)
 
-// ReserveWithIdempotency checks idempotency key first, then reserves tokens.
-// If the same request ID is seen again, it returns the cached result.
+// ReserveWithIdempotency rejects a repeated request ID before reserving tokens.
+// The key is scoped by user and expires after 10 minutes.
 func (e *Engine) ReserveWithIdempotency(ctx context.Context, userID int64, estimatedTokens int64, requestID string) error {
 	if requestID != "" {
-		idemKey := fmt.Sprintf("idem:%s", requestID)
-		exists, err := e.rdb.Exists(ctx, idemKey).Result()
+		idemKey := fmt.Sprintf("idem:%d:%s", userID, requestID)
+		ok, err := e.rdb.SetNX(ctx, idemKey, "1", 10*time.Minute).Result()
 		if err != nil {
 			return err
 		}
-		if exists > 0 {
+		if !ok {
 			return ErrDuplicateRequest
 		}
+		if err := e.Reserve(ctx, userID, estimatedTokens); err != nil {
+			e.rdb.Del(ctx, idemKey)
+			return err
+		}
+		return nil
 	}
-
-	if err := e.Reserve(ctx, userID, estimatedTokens); err != nil {
-		return err
-	}
-
-	if requestID != "" {
-		idemKey := fmt.Sprintf("idem:%s", requestID)
-		e.rdb.Set(ctx, idemKey, "1", 10*time.Minute)
-	}
-	return nil
+	return e.Reserve(ctx, userID, estimatedTokens)
 }
 
 func (e *Engine) Reserve(ctx context.Context, userID int64, estimatedTokens int64) error {
@@ -136,6 +138,17 @@ func (e *Engine) Reserve(ctx context.Context, userID int64, estimatedTokens int6
 		estimatedTokens = 1
 	}
 	key := fmt.Sprintf("balance:%d", userID)
+	exists, err := e.rdb.Exists(ctx, key).Result()
+	if err != nil {
+		e.logger.Error("balance cache check failed", zap.Int64("user_id", userID), zap.Error(err))
+		return err
+	}
+	if exists == 0 {
+		if _, err := e.CheckBalance(ctx, userID); err != nil {
+			e.logger.Error("load balance from db failed", zap.Int64("user_id", userID), zap.Error(err))
+			return err
+		}
+	}
 	result, err := reserveScript.Run(ctx, e.rdb, []string{key}, estimatedTokens).Int64()
 	if err != nil {
 		e.logger.Error("reserve failed", zap.Int64("user_id", userID), zap.Error(err))
@@ -148,13 +161,19 @@ func (e *Engine) Reserve(ctx context.Context, userID int64, estimatedTokens int6
 	return nil
 }
 
-func (e *Engine) Settle(ctx context.Context, userID int64, estimatedTokens, actualTokens int64, usageID int64, model string) error {
+func (e *Engine) Settle(ctx context.Context, userID int64, estimatedTokens, actualTokens int64, usageID *int64, model string) error {
 	diff := estimatedTokens - actualTokens
 	key := fmt.Sprintf("balance:%d", userID)
 	if diff > 0 {
-		e.rdb.IncrBy(ctx, key, diff)
+		if err := e.rdb.IncrBy(ctx, key, diff).Err(); err != nil {
+			e.logger.Error("settle refund failed", zap.Int64("user_id", userID), zap.Error(err))
+			return err
+		}
 	} else if diff < 0 {
-		e.rdb.DecrBy(ctx, key, -diff)
+		if err := e.rdb.DecrBy(ctx, key, -diff).Err(); err != nil {
+			e.logger.Error("settle charge failed", zap.Int64("user_id", userID), zap.Error(err))
+			return err
+		}
 	}
 
 	metrics.TokensConsumed.WithLabelValues(model).Add(float64(actualTokens))
@@ -176,7 +195,7 @@ func (e *Engine) Settle(ctx context.Context, userID int64, estimatedTokens, actu
 }
 
 // RefundWithCompensation refunds tokens synchronously; on failure, enqueues compensation.
-func (e *Engine) RefundWithCompensation(ctx context.Context, userID int64, amount int64, usageID int64) error {
+func (e *Engine) RefundWithCompensation(ctx context.Context, userID int64, amount int64, usageID *int64) error {
 	key := fmt.Sprintf("balance:%d", userID)
 	err := e.rdb.IncrBy(ctx, key, amount).Err()
 	if err != nil {
@@ -200,6 +219,7 @@ func (e *Engine) RefundWithCompensation(ctx context.Context, userID int64, amoun
 		userID, amount, bal, usageID)
 	if err != nil {
 		e.logger.Error("refund balance log insert failed", zap.Int64("user_id", userID), zap.Error(err))
+		return err
 	}
 	return nil
 }
@@ -221,9 +241,13 @@ func (e *Engine) Recharge(ctx context.Context, userID int64, amount int64) error
 		if err != nil {
 			return err
 		}
-		e.rdb.Set(ctx, key, balance, 0)
+		if err := e.rdb.SetNX(ctx, key, balance, 0).Err(); err != nil {
+			return err
+		}
 	}
-	e.rdb.IncrBy(ctx, key, amount)
+	if err := e.rdb.IncrBy(ctx, key, amount).Err(); err != nil {
+		return err
+	}
 
 	bal, _ := e.rdb.Get(ctx, key).Int64()
 	_, err = e.db.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after) VALUES (?, 'recharge', ?, ?)",

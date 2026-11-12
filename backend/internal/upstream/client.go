@@ -160,9 +160,12 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, htt
 		metrics.UpstreamErrors.WithLabelValues("circuit_open").Inc()
 		return nil, nil, ErrCircuitOpen
 	}
+	if len(req.Messages) == 0 {
+		return nil, nil, fmt.Errorf("messages is required")
+	}
 
 	if c.mockMode {
-		contentLen := int64(len(req.Messages[0].Content)) / 4 + 1
+		contentLen := int64(len(req.Messages[0].Content))/4 + 1
 		c.recordSuccess()
 		return &ChatResponse{
 			ID:     "mock-resp",
@@ -213,4 +216,3 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, htt
 	c.recordSuccess()
 	return &chatResp, resp.Header, nil
 }
-

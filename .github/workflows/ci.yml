@@ -26,12 +26,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache-dependency-path: backend/go.sum
       - name: Create database and user
         run: mysql -h 127.0.0.1 -uroot -proot -e "CREATE DATABASE llm_gateway CHARACTER SET utf8mb4; CREATE USER IF NOT EXISTS gateway@'%' IDENTIFIED BY 'gateway123'; GRANT ALL ON llm_gateway.* TO gateway@'%'; FLUSH PRIVILEGES;"
       - name: Run tests
         working-directory: backend
         env:
           TEST_MYSQL_DSN: "gateway:gateway123@tcp(127.0.0.1:3306)/llm_gateway?parseTime=true&charset=utf8mb4"
+          REQUIRE_TEST_DB: "true"
         run: go test ./... -v -count=1
 
   build:
@@ -41,9 +43,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache-dependency-path: backend/go.sum
       - name: Build backend
         working-directory: backend
-        run: go build ./...
+        run: |
+          go build ./...
+          go vet ./...
 
       - uses: actions/setup-node@v4
         with:
