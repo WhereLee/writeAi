@@ -42,3 +42,4 @@ jobs:
             docker compose up -d server
             sleep 3
             curl -s http://localhost:8080/healthz
+

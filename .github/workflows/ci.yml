@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: 'stable'
       - name: Create database and user
         run: mysql -h 127.0.0.1 -uroot -proot -e "CREATE DATABASE llm_gateway CHARACTER SET utf8mb4; CREATE USER IF NOT EXISTS gateway@'%' IDENTIFIED BY 'gateway123'; GRANT ALL ON llm_gateway.* TO gateway@'%'; FLUSH PRIVILEGES;"
       - name: Run tests
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: 'stable'
       - name: Build backend
         working-directory: backend
         run: go build ./...
@@ -61,3 +61,4 @@ jobs:
       - name: Build Docker image
         working-directory: backend
         run: docker build -t llm-api-gateway:latest .
+
