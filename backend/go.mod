@@ -1,6 +1,6 @@
 module github.com/lrs/llm-api-gateway
 
-go 1.26.3
+go 1.23
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
@@ -31,3 +31,4 @@ require (
 	golang.org/x/sys v0.50.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
