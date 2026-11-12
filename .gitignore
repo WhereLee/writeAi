@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+*.exe
+backend/bin
+backend/llm-server
+backend/llm-server-test
+__pycache__
+*.pyc
+.DS_Store

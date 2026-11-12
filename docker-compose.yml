@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  server:
+    image: ghcr.io/wherelee/llm-api-gateway:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - MYSQL_DSN=${MYSQL_DSN}
+      - REDIS_ADDR=${REDIS_ADDR}
+      - JWT_SECRET=${JWT_SECRET}
+      - UPSTREAM_URL=${UPSTREAM_URL}
+      - UPSTREAM_KEY=${UPSTREAM_KEY}
+      - APP_ENV=production
+    depends_on:
+      - mysql
+      - redis
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3030:3000"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
