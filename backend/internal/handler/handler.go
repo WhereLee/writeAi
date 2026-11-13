@@ -136,6 +136,31 @@ func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, keys)
 }
 
+func (h *Handler) DisableAPIKey(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	keyID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid key id"})
+		return
+	}
+
+	result, err := h.db.ExecContext(r.Context(), "UPDATE api_keys SET is_active = FALSE WHERE id = ? AND user_id = ?", keyID, userID)
+	if err != nil {
+		h.logger.Error("disable api key failed", zap.Int64("user_id", userID), zap.Int64("key_id", keyID), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"id": keyID, "is_active": false})
+}
+
 func (h *Handler) GetBalance(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {

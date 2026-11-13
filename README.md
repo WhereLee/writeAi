@@ -35,7 +35,7 @@ cp frontend/.env.example frontend/.env
 
 - `POST /api/register`, `POST /api/login`
 - `GET /api/plans` (public)
-- `GET /api/balance`, `GET /api/keys`, `POST /api/keys` (JWT)
+- `GET /api/balance`, `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{id}` (JWT)
 - `GET /api/orders`, `POST /api/orders`, `POST /api/orders/{id}/pay` (JWT)
 - `POST /v1/chat/completions` (`X-API-Key`)
 - `GET /healthz`, `GET /readyz`, `GET /metrics`
@@ -56,7 +56,26 @@ host MySQL and Redis instances.
 - `CD` runs after `CI` succeeds on `main`: it builds and pushes
   `ghcr.io/wherelee/llm-api-gateway`, then pulls and restarts the container on
   the server with a health check and rollback.
+- Server deployment logic lives in `scripts/deploy.sh`: pull retries, lock,
+  health check and rollback.
 - Manual deploys: Actions -> CD -> Run workflow.
-- Required repository secrets: `SERVER_HOST`, `SERVER_USER`, `SERVER_PASSWORD`.
+- Required repository secrets: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`.
+- `SERVER_PASSWORD` is kept only as a fallback for password-based SSH.
 - First-time server setup: copy `deploy/server.env.example` to
   `/opt/llm-gateway/server.env`, fill in real values, and `chmod 600` it.
+
+## Testing
+
+```bash
+cd backend
+go build ./...
+go vet ./...
+go test ./... -count=1
+go test -race ./... -count=1
+
+cd ../frontend
+npm run build
+
+cd ..
+actionlint .github/workflows/ci.yml .github/workflows/cd.yml
+```

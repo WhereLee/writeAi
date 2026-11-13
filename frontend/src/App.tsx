@@ -18,6 +18,15 @@ interface APIKey {
   created_at: string;
 }
 
+interface Order {
+  id: number;
+  plan_id: number;
+  amount_cents: number;
+  status: string;
+  created_at: string;
+  paid_at: string | null;
+}
+
 
 function App() {
   const [token, setToken] = useState<string>(localStorage.getItem("token") || "");
@@ -26,6 +35,7 @@ function App() {
   const [balance, setBalance] = useState<number>(0);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [keys, setKeys] = useState<APIKey[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
   const [keyName, setKeyName] = useState("");
   const [newKey, setNewKey] = useState("");
   const [message, setMessage] = useState("");
@@ -60,22 +70,33 @@ function App() {
     }
   }, [username, password]);
 
+  const handleUnauthorized = useCallback((res: Response) => {
+    if (res.status !== 401) return false;
+    setToken("");
+    localStorage.removeItem("token");
+    setPage("login");
+    return true;
+  }, []);
+
   const fetchData = useCallback(async () => {
     if (!token) return;
     const headers = { Authorization: `Bearer ${token}` };
     try {
-      const [balRes, planRes, keyRes] = await Promise.all([
+      const [balRes, planRes, keyRes, orderRes] = await Promise.all([
         fetch(`${API_BASE}/api/balance`, { headers }),
         fetch(`${API_BASE}/api/plans`),
         fetch(`${API_BASE}/api/keys`, { headers }),
+        fetch(`${API_BASE}/api/orders`, { headers }),
       ]);
+      if ([balRes, keyRes, orderRes].some(handleUnauthorized)) return;
       if (balRes.ok) setBalance((await balRes.json()).balance);
       if (planRes.ok) setPlans(await planRes.json());
       if (keyRes.ok) setKeys(await keyRes.json());
+      if (orderRes.ok) setOrders(await orderRes.json());
     } catch {
       setError("Failed to load data");
     }
-  }, [token]);
+  }, [token, handleUnauthorized]);
 
   const createKey = useCallback(async () => {
     setError("");
@@ -88,6 +109,7 @@ function App() {
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ name: keyName }),
       });
+      if (handleUnauthorized(res)) return;
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || "Failed to create key");
@@ -101,7 +123,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [token, keyName, fetchData]);
+  }, [token, keyName, fetchData, handleUnauthorized]);
 
   const buyPlan = useCallback(async (planID: number) => {
     setError("");
@@ -114,12 +136,14 @@ function App() {
         headers,
         body: JSON.stringify({ plan_id: planID }),
       });
+      if (handleUnauthorized(createRes)) return;
       const order = await createRes.json();
       if (!createRes.ok) {
         setError(order.error || "Failed to create order");
         return;
       }
       const payRes = await fetch(`${API_BASE}/api/orders/${order.id}/pay`, { method: "POST", headers });
+      if (handleUnauthorized(payRes)) return;
       const paid = await payRes.json();
       if (!payRes.ok) {
         setError(paid.error || "Failed to pay order");
@@ -132,7 +156,31 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [token, fetchData]);
+  }, [token, fetchData, handleUnauthorized]);
+
+  const disableKey = useCallback(async (id: number) => {
+    setError("");
+    setMessage("");
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/keys/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (handleUnauthorized(res)) return;
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Failed to disable key");
+        return;
+      }
+      setMessage(`Key #${id} disabled`);
+      await fetchData();
+    } catch {
+      setError("Network error");
+    } finally {
+      setBusy(false);
+    }
+  }, [token, fetchData, handleUnauthorized]);
 
   useEffect(() => {
     if (token) fetchData();
@@ -188,7 +236,7 @@ function App() {
           )}
           <table style={styles.table}>
             <thead>
-              <tr><th>Name</th><th>Key</th><th>Status</th><th>Created</th></tr>
+              <tr><th>Name</th><th>Key</th><th>Status</th><th>Created</th><th>Actions</th></tr>
             </thead>
             <tbody>
               {keys.map(k => (
@@ -197,9 +245,14 @@ function App() {
                   <td style={{ fontFamily: "monospace", fontSize: 12 }}>{k.key.slice(0, 16)}...</td>
                   <td>{k.is_active ? "Active" : "Disabled"}</td>
                   <td>{new Date(k.created_at).toLocaleDateString()}</td>
+                  <td>
+                    {k.is_active && (
+                      <button style={styles.smallButton} onClick={() => disableKey(k.id)} disabled={busy}>Disable</button>
+                    )}
+                  </td>
                 </tr>
               ))}
-              {keys.length === 0 && <tr><td colSpan={4}>No API keys yet</td></tr>}
+              {keys.length === 0 && <tr><td colSpan={5}>No API keys yet</td></tr>}
             </tbody>
           </table>
         </section>
@@ -219,6 +272,28 @@ function App() {
           </div>
           <p style={styles.note}>Payment is a demo endpoint and is disabled unless ALLOW_MOCK_PAYMENT=true.</p>
         </section>
+
+        <section style={styles.section}>
+          <h2>Orders</h2>
+          <table style={styles.table}>
+            <thead>
+              <tr><th>ID</th><th>Plan</th><th>Amount</th><th>Status</th><th>Created</th><th>Paid</th></tr>
+            </thead>
+            <tbody>
+              {orders.map(o => (
+                <tr key={o.id}>
+                  <td>{o.id}</td>
+                  <td>{plans.find(p => p.id === o.plan_id)?.name || o.plan_id}</td>
+                  <td>¥{(o.amount_cents / 100).toFixed(2)}</td>
+                  <td>{o.status}</td>
+                  <td>{new Date(o.created_at).toLocaleString()}</td>
+                  <td>{o.paid_at ? new Date(o.paid_at).toLocaleString() : "-"}</td>
+                </tr>
+              ))}
+              {orders.length === 0 && <tr><td colSpan={6}>No orders yet</td></tr>}
+            </tbody>
+          </table>
+        </section>
       </div>
     </div>
   );
@@ -230,6 +305,7 @@ const styles: Record<string, React.CSSProperties> = {
   title: { textAlign: "center", marginBottom: 24, color: "#1e293b" },
   input: { width: "100%", padding: "10px 12px", marginBottom: 12, border: "1px solid #d1d5db", borderRadius: 6, fontSize: 14, boxSizing: "border-box" },
   button: { flex: 1, padding: "10px 20px", background: "#1e40af", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 14 },
+  smallButton: { padding: "4px 10px", background: "#b91c1c", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", fontSize: 12 },
   navButton: { padding: "6px 16px", background: "#ef4444", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer" },
   error: { color: "#dc2626", marginTop: 12, fontSize: 14 },
   success: { color: "#15803d", marginTop: 12, fontSize: 14 },

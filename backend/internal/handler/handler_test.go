@@ -63,12 +63,14 @@ func TestOrderPayFlow(t *testing.T) {
 	db.Exec("DELETE FROM balance_logs WHERE user_id = ?", userID)
 	db.Exec("DELETE FROM orders WHERE user_id = ?", userID)
 	db.Exec("DELETE FROM balances WHERE user_id = ?", userID)
+	db.Exec("DELETE FROM api_keys WHERE user_id = ?", userID)
 	_, err := db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 0)", userID)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		db.Exec("DELETE FROM balance_logs WHERE user_id = ?", userID)
 		db.Exec("DELETE FROM orders WHERE user_id = ?", userID)
 		db.Exec("DELETE FROM balances WHERE user_id = ?", userID)
+		db.Exec("DELETE FROM api_keys WHERE user_id = ?", userID)
 	})
 
 	mr := miniredis.RunT(t)
@@ -85,6 +87,7 @@ func TestOrderPayFlow(t *testing.T) {
 		r.Get("/api/orders", h.ListOrders)
 		r.Post("/api/orders", h.CreateOrder)
 		r.Post("/api/orders/{id}/pay", h.PayOrder)
+		r.Delete("/api/keys/{id}", h.DisableAPIKey)
 	})
 	token := handlerTestToken(t, userID, "test-secret")
 
@@ -120,4 +123,17 @@ func TestOrderPayFlow(t *testing.T) {
 	var logs int
 	require.NoError(t, db.Get(&logs, "SELECT COUNT(*) FROM balance_logs WHERE user_id = ? AND type = 'recharge'", userID))
 	assert.Equal(t, 1, logs)
+
+	keyResult, err := db.Exec("INSERT INTO api_keys (user_id, `key`, name) VALUES (?, ?, ?)", userID, "sk-test-disable", "test")
+	require.NoError(t, err)
+	keyID, err := keyResult.LastInsertId()
+	require.NoError(t, err)
+	delReq := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/keys/%d", keyID), nil)
+	delReq.Header.Set("Authorization", "Bearer "+token)
+	delRec := httptest.NewRecorder()
+	r.ServeHTTP(delRec, delReq)
+	require.Equal(t, http.StatusOK, delRec.Code, delRec.Body.String())
+	var active bool
+	require.NoError(t, db.Get(&active, "SELECT is_active FROM api_keys WHERE id = ?", keyID))
+	assert.False(t, active)
 }

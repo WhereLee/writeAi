@@ -71,6 +71,7 @@ func main() {
 		r.Use(middleware.JWTAuth(cfg.JWTSecret))
 		r.Get("/api/keys", h.ListAPIKeys)
 		r.Post("/api/keys", h.CreateAPIKey)
+		r.Delete("/api/keys/{id}", h.DisableAPIKey)
 		r.Get("/api/balance", h.GetBalance)
 		r.Get("/api/orders", h.ListOrders)
 		r.Post("/api/orders", h.CreateOrder)
