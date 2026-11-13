@@ -1,0 +1,15 @@
+[Unit]
+Description=LLM Gateway Alert Relay
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/llm-gateway-alert-relay.env
+ExecStart=/usr/bin/python3 /opt/llm-gateway/alert-relay.py
+Restart=always
+RestartSec=5
+User=deploy
+Group=deploy
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,9 @@
 # LLM API Gateway
 
+![CI](https://github.com/WhereLee/writeAi/actions/workflows/ci.yml/badge.svg)
+![CD](https://github.com/WhereLee/writeAi/actions/workflows/cd.yml/badge.svg)
+![Uptime](https://github.com/WhereLee/writeAi/actions/workflows/uptime.yml/badge.svg)
+
 LLM API billing gateway: admins grant credits, users call LLM APIs through a unified endpoint, and are billed per actual token consumption.
 
 ## Architecture
@@ -14,7 +18,8 @@ LLM API billing gateway: admins grant credits, users call LLM APIs through a uni
 ```bash
 # Backend
 cd backend
-go run ./cmd/server
+# Windows PowerShell: bind loopback to avoid a firewall prompt
+$env:BIND_ADDR="127.0.0.1"; go run ./cmd/server
 
 # Frontend
 cd frontend
@@ -79,6 +84,9 @@ host MySQL and Redis instances.
   health check and rollback.
 - Production entrypoint is Nginx on `8080` with a self-signed certificate: it serves `/opt/dist` and proxies
   `/api/`, `/v1/`, `/healthz` and `/readyz` to `127.0.0.1:18080`. Use `https://118.31.111.223:8080`; browsers will warn until you trust `llm-gateway.crt`, or use `curl -k`.
+- Domain, ICP filing and payment are intentionally out of scope here. They live in the
+  companion course-platform project. This gateway keeps a self-signed IP entrypoint for
+  internal use and demos, so the two projects do not duplicate the same business surface.
 - `scripts/backup.sh` runs daily from `/etc/cron.d/llm-gateway-backup`.
 - Prometheus alert rules are in `prometheus-alerts.yml`.
 - Manual deploys: Actions -> CD -> Run workflow.
