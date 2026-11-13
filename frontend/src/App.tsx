@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://118.31.111.223:8080";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://118.31.111.223:8080";
 
 interface Plan {
   id: number;
@@ -12,9 +12,11 @@ interface Plan {
 
 interface APIKey {
   id: number;
-  key: string;
+  key_prefix: string;
   name: string;
   is_active: boolean;
+  expires_at: string | null;
+  last_used_at: string | null;
   created_at: string;
 }
 
@@ -32,11 +34,13 @@ function App() {
   const [token, setToken] = useState<string>(localStorage.getItem("token") || "");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [balance, setBalance] = useState<number>(0);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [keys, setKeys] = useState<APIKey[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [keyName, setKeyName] = useState("");
+  const [expiresInDays, setExpiresInDays] = useState("");
   const [newKey, setNewKey] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -54,7 +58,11 @@ function App() {
       const res = await fetch(`${API_BASE}/api/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({
+          username,
+          password,
+          ...(endpoint === "register" ? { invite_code: inviteCode } : {}),
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -68,7 +76,7 @@ function App() {
     } catch {
       setError("Network error");
     }
-  }, [username, password]);
+  }, [username, password, inviteCode]);
 
   const handleUnauthorized = useCallback((res: Response) => {
     if (res.status !== 401) return false;
@@ -107,7 +115,7 @@ function App() {
       const res = await fetch(`${API_BASE}/api/keys`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: keyName }),
+        body: JSON.stringify({ name: keyName, expires_in_days: Number(expiresInDays) || 0 }),
       });
       if (handleUnauthorized(res)) return;
       const data = await res.json();
@@ -123,7 +131,7 @@ function App() {
     } finally {
       setBusy(false);
     }
-  }, [token, keyName, fetchData, handleUnauthorized]);
+  }, [token, keyName, expiresInDays, fetchData, handleUnauthorized]);
 
   const buyPlan = useCallback(async (planID: number) => {
     setError("");
@@ -199,6 +207,7 @@ function App() {
           <h1 style={styles.title}>LLM API Gateway</h1>
           <input style={styles.input} placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} />
           <input style={styles.input} type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} />
+          <input style={styles.input} placeholder="Invite code (register only)" value={inviteCode} onChange={e => setInviteCode(e.target.value)} />
           <div style={{ display: "flex", gap: 8 }}>
             <button style={styles.button} onClick={() => auth("login")}>Login</button>
             <button style={{ ...styles.button, background: "#2563eb" }} onClick={() => auth("register")}>Register</button>
@@ -229,6 +238,12 @@ function App() {
               value={keyName}
               onChange={e => setKeyName(e.target.value)}
             />
+            <input
+              style={{ ...styles.input, marginBottom: 0, maxWidth: 140 }}
+              placeholder="Expires (days)"
+              value={expiresInDays}
+              onChange={e => setExpiresInDays(e.target.value)}
+            />
             <button style={styles.button} onClick={createKey} disabled={busy}>Create key</button>
           </div>
           {newKey && (
@@ -236,14 +251,16 @@ function App() {
           )}
           <table style={styles.table}>
             <thead>
-              <tr><th>Name</th><th>Key</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+              <tr><th>Name</th><th>Key</th><th>Status</th><th>Expires</th><th>Last used</th><th>Created</th><th>Actions</th></tr>
             </thead>
             <tbody>
               {keys.map(k => (
                 <tr key={k.id}>
                   <td>{k.name || "-"}</td>
-                  <td style={{ fontFamily: "monospace", fontSize: 12 }}>{k.key.slice(0, 16)}...</td>
+                  <td style={{ fontFamily: "monospace", fontSize: 12 }}>{k.key_prefix}...</td>
                   <td>{k.is_active ? "Active" : "Disabled"}</td>
+                  <td>{k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "Never"}</td>
+                  <td>{k.last_used_at ? new Date(k.last_used_at).toLocaleString() : "Never"}</td>
                   <td>{new Date(k.created_at).toLocaleDateString()}</td>
                   <td>
                     {k.is_active && (
@@ -252,7 +269,7 @@ function App() {
                   </td>
                 </tr>
               ))}
-              {keys.length === 0 && <tr><td colSpan={5}>No API keys yet</td></tr>}
+              {keys.length === 0 && <tr><td colSpan={7}>No API keys yet</td></tr>}
             </tbody>
           </table>
         </section>
