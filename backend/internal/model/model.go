@@ -6,6 +6,7 @@ type User struct {
 	ID           int64     `db:"id" json:"id"`
 	Username     string    `db:"username" json:"username"`
 	PasswordHash string    `db:"password_hash" json:"-"`
+	Role         string    `db:"role" json:"role"`
 	CreatedAt    time.Time `db:"created_at" json:"created_at"`
 }
 
@@ -27,24 +28,6 @@ type Balance struct {
 	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
-type Plan struct {
-	ID           int64   `db:"id" json:"id"`
-	Name         string  `db:"name" json:"name"`
-	TokenAmount  int64   `db:"token_amount" json:"token_amount"`
-	PriceCents   int64   `db:"price_cents" json:"price_cents"`
-	DiscountRate float64 `db:"discount_rate" json:"discount_rate"`
-}
-
-type Order struct {
-	ID          int64      `db:"id" json:"id"`
-	UserID      int64      `db:"user_id" json:"user_id"`
-	PlanID      int64      `db:"plan_id" json:"plan_id"`
-	AmountCents int64      `db:"amount_cents" json:"amount_cents"`
-	Status      string     `db:"status" json:"status"`
-	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
-	PaidAt      *time.Time `db:"paid_at" json:"paid_at"`
-}
-
 type UsageLog struct {
 	ID           int64     `db:"id" json:"id"`
 	UserID       int64     `db:"user_id" json:"user_id"`
@@ -60,11 +43,53 @@ type UsageLog struct {
 }
 
 type BalanceLog struct {
-	ID           int64     `db:"id" json:"id"`
-	UserID       int64     `db:"user_id" json:"user_id"`
-	Type         string    `db:"type" json:"type"`
-	Amount       int64     `db:"amount" json:"amount"`
-	BalanceAfter int64     `db:"balance_after" json:"balance_after"`
-	UsageLogID   *int64    `db:"usage_log_id" json:"usage_log_id"`
-	CreatedAt    time.Time `db:"created_at" json:"created_at"`
+	ID            int64     `db:"id" json:"id"`
+	UserID        int64     `db:"user_id" json:"user_id"`
+	Type          string    `db:"type" json:"type"`
+	Amount        int64     `db:"amount" json:"amount"`
+	BalanceAfter  int64     `db:"balance_after" json:"balance_after"`
+	UsageLogID    *int64    `db:"usage_log_id" json:"usage_log_id,omitempty"`
+	ReferenceType *string   `db:"reference_type" json:"reference_type,omitempty"`
+	ReferenceID   *int64    `db:"reference_id" json:"reference_id,omitempty"`
+	OperatorID    *int64    `db:"operator_id" json:"operator_id,omitempty"`
+	Reason        *string   `db:"reason" json:"reason,omitempty"`
+	CreatedAt     time.Time `db:"created_at" json:"created_at"`
+}
+
+type CreditOperation struct {
+	ID              int64     `db:"id" json:"id"`
+	OpNo            string    `db:"op_no" json:"op_no"`
+	UserID          int64     `db:"user_id" json:"user_id"`
+	Kind            string    `db:"kind" json:"kind"`
+	DeltaTokens     int64     `db:"delta_tokens" json:"delta_tokens"`
+	BalanceBefore   int64     `db:"balance_before" json:"balance_before"`
+	BalanceAfter    int64     `db:"balance_after" json:"balance_after"`
+	Reason          string    `db:"reason" json:"reason"`
+	OperatorID      int64     `db:"operator_id" json:"operator_id"`
+	ClientRequestID string    `db:"client_request_id" json:"client_request_id"`
+	CreatedAt       time.Time `db:"created_at" json:"created_at"`
+}
+
+type AdminAuditLog struct {
+	ID         int64     `db:"id" json:"id"`
+	ActorID    int64     `db:"actor_id" json:"actor_id"`
+	Action     string    `db:"action" json:"action"`
+	TargetType string    `db:"target_type" json:"target_type"`
+	TargetID   int64     `db:"target_id" json:"target_id"`
+	RequestID  *string   `db:"request_id" json:"request_id,omitempty"`
+	IP         *string   `db:"ip" json:"ip,omitempty"`
+	UserAgent  *string   `db:"user_agent" json:"user_agent,omitempty"`
+	Detail     []byte    `db:"detail" json:"detail,omitempty"`
+	CreatedAt  time.Time `db:"created_at" json:"created_at"`
+}
+
+type BalanceHold struct {
+	ID        int64      `db:"id" json:"id"`
+	RequestID string     `db:"request_id" json:"request_id"`
+	UserID    int64      `db:"user_id" json:"user_id"`
+	Amount    int64      `db:"amount" json:"amount"`
+	Status    string     `db:"status" json:"status"`
+	ExpiresAt time.Time  `db:"expires_at" json:"expires_at"`
+	CreatedAt time.Time  `db:"created_at" json:"created_at"`
+	SettledAt *time.Time `db:"settled_at" json:"settled_at,omitempty"`
 }

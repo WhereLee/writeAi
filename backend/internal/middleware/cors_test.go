@@ -69,7 +69,7 @@ func TestCORSDisallowedOriginDoesNotBlockNormalRequest(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/plans", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/models", nil)
 	req.Header.Set("Origin", "http://evil.example")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

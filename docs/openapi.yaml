@@ -44,19 +44,6 @@ components:
           type: string
         password:
           type: string
-    Plan:
-      type: object
-      properties:
-        id:
-          type: integer
-        name:
-          type: string
-        token_amount:
-          type: integer
-        price_cents:
-          type: integer
-        discount_rate:
-          type: number
     APIKey:
       type: object
       properties:
@@ -78,25 +65,78 @@ components:
           nullable: true
         created_at:
           type: string
-    Order:
+    CreditChangeRequest:
       type: object
+      required: [user_id, credits, reason]
       properties:
-        id:
-          type: integer
         user_id:
           type: integer
-        plan_id:
-          type: integer
-        amount_cents:
-          type: integer
-        status:
+        credits:
+          type: number
+          description: Positive number of credits; the server converts it to integer tokens.
+        reason:
           type: string
-          enum: [pending, paying, paid, failed]
-        created_at:
-          type: string
-        paid_at:
-          type: string
-          nullable: true
+          maxLength: 255
+    CreditOperation:
+      type: object
+      properties:
+        id: {type: integer}
+        op_no: {type: string}
+        user_id: {type: integer}
+        kind: {type: string, enum: [GRANT, REVOKE]}
+        delta_tokens: {type: integer}
+        balance_before: {type: integer}
+        balance_after: {type: integer}
+        reason: {type: string}
+        operator_id: {type: integer}
+        client_request_id: {type: string}
+        created_at: {type: string}
+    BalanceLog:
+      type: object
+      properties:
+        id: {type: integer}
+        user_id: {type: integer}
+        type: {type: string}
+        amount: {type: integer}
+        balance_after: {type: integer}
+        usage_log_id: {type: integer, nullable: true}
+        reference_type: {type: string, nullable: true}
+        reference_id: {type: integer, nullable: true}
+        operator_id: {type: integer, nullable: true}
+        reason: {type: string, nullable: true}
+        created_at: {type: string}
+    UsageLog:
+      type: object
+      properties:
+        id: {type: integer}
+        model: {type: string}
+        prompt_tokens: {type: integer}
+        output_tokens: {type: integer}
+        total_tokens: {type: integer}
+        latency_ms: {type: integer}
+        status_code: {type: integer}
+        created_at: {type: string}
+    AdminUser:
+      type: object
+      properties:
+        id: {type: integer}
+        username: {type: string}
+        role: {type: string}
+        tokens: {type: integer}
+        credits: {type: string}
+        created_at: {type: string}
+    AuditLog:
+      type: object
+      properties:
+        id: {type: integer}
+        actor_id: {type: integer}
+        action: {type: string}
+        target_type: {type: string}
+        target_id: {type: integer}
+        request_id: {type: string, nullable: true}
+        ip: {type: string, nullable: true}
+        detail: {type: object, nullable: true}
+        created_at: {type: string}
     ChatRequest:
       type: object
       required: [model, messages]
@@ -176,18 +216,27 @@ paths:
           description: Invalid credentials
         '429':
           description: Too many requests
-  /api/plans:
+  /api/me:
     get:
-      summary: List plans
+      summary: Get current user, role, and balance
+      security:
+        - BearerAuth: []
       responses:
         '200':
-          description: Plans
+          description: User profile and balance
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Plan'
+                type: object
+                properties:
+                  user_id: {type: integer}
+                  username: {type: string}
+                  role: {type: string, enum: [user, admin]}
+                  tokens: {type: integer}
+                  credits: {type: string}
+                  tokens_per_credit: {type: integer}
+        '401':
+          description: Unauthorized
   /api/models:
     get:
       summary: List configured models
@@ -281,60 +330,175 @@ paths:
           description: Disabled
         '404':
           description: Key not found for this user
-  /api/orders:
+  /api/credits/ledger:
     get:
-      summary: List current user's orders
+      summary: List current user's balance ledger
       security:
         - BearerAuth: []
+      parameters:
+        - name: type
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, maximum: 100, default: 20}
+        - name: offset
+          in: query
+          schema: {type: integer, default: 0}
       responses:
         '200':
-          description: Orders
+          description: Ledger entries, newest first
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/Order'
-    post:
-      summary: Create a pending order
+                  $ref: '#/components/schemas/BalanceLog'
+  /api/usage:
+    get:
+      summary: List current user's usage
       security:
         - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, maximum: 100, default: 20}
+        - name: offset
+          in: query
+          schema: {type: integer, default: 0}
+      responses:
+        '200':
+          description: Usage entries, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UsageLog'
+  /api/admin/credits/grant:
+    post:
+      summary: Grant credits to a user
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: {type: string}
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [plan_id]
-              properties:
-                plan_id:
-                  type: integer
+              $ref: '#/components/schemas/CreditChangeRequest'
       responses:
-        '201':
-          description: Pending order
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Order'
-  /api/orders/{id}/pay:
+        '200':
+          description: Applied, or the original operation for a repeated idempotency key
+        '400':
+          description: Invalid amount, reason, or per-operation limit exceeded
+        '403':
+          description: Admin role required
+        '404':
+          description: User not found
+  /api/admin/credits/revoke:
     post:
-      summary: Pay a pending order (demo only)
-      description: Requires ALLOW_MOCK_PAYMENT=true.
+      summary: Revoke credits from a user
       security:
         - BearerAuth: []
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: integer
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreditChangeRequest'
       responses:
         '200':
-          description: Paid and credited
-        '403':
-          description: Mock payment disabled
+          description: Applied, or the original operation for a repeated idempotency key
         '409':
-          description: Order is not pending
+          description: Balance would become negative
+  /api/admin/credits/operations:
+    get:
+      summary: List credit operations
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: user_id
+          in: query
+          schema: {type: integer}
+        - name: operator_id
+          in: query
+          schema: {type: integer}
+        - name: limit
+          in: query
+          schema: {type: integer, maximum: 100, default: 20}
+        - name: offset
+          in: query
+          schema: {type: integer, default: 0}
+      responses:
+        '200':
+          description: Operations, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CreditOperation'
+  /api/admin/users:
+    get:
+      summary: List or search users
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, maximum: 100, default: 20}
+        - name: offset
+          in: query
+          schema: {type: integer, default: 0}
+      responses:
+        '200':
+          description: Users with balances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminUser'
+  /api/admin/audit-logs:
+    get:
+      summary: List admin audit logs
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: actor_id
+          in: query
+          schema: {type: integer}
+        - name: action
+          in: query
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, maximum: 100, default: 20}
+        - name: offset
+          in: query
+          schema: {type: integer, default: 0}
+      responses:
+        '200':
+          description: Audit logs, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditLog'
   /v1/chat/completions:
     post:
       summary: Chat completion proxy

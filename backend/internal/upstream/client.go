@@ -130,6 +130,7 @@ type ChatRequest struct {
 	Messages      []Message      `json:"messages"`
 	Stream        bool           `json:"stream,omitempty"`
 	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+	MaxTokens     int64          `json:"max_tokens,omitempty"`
 }
 
 type StreamOptions struct {

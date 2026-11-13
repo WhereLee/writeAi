@@ -47,6 +47,16 @@ func main() {
 		log.Fatal("migrate failed", zap.Error(err))
 	}
 	log.Info("MySQL connected")
+	for _, username := range cfg.BootstrapAdminUsernames {
+		result, err := db.Exec("UPDATE users SET role = 'admin' WHERE username = ?", username)
+		if err != nil {
+			log.Error("bootstrap admin failed", zap.String("username", username), zap.Error(err))
+			continue
+		}
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			log.Info("bootstrap admin promoted", zap.String("username", username))
+		}
+	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
@@ -54,35 +64,45 @@ func main() {
 	}
 	log.Info("Redis connected")
 
-	billingEngine := billing.NewEngine(rdb, db, log)
+	billingEngine := billing.NewEngine(db, log)
 	modelRoutes := make(map[string]upstream.Route, len(cfg.ModelRoutes))
 	for model, route := range cfg.ModelRoutes {
 		modelRoutes[model] = upstream.Route{URL: route.URL, Key: route.Key}
 	}
 	upstreamRouter := upstream.NewRouter(cfg.UpstreamURL, cfg.UpstreamKey, modelRoutes, log)
 	rateLimiter := middleware.NewRateLimiter(rdb)
-	h := handler.NewHandler(db, billingEngine, upstreamRouter, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin, cfg.AllowMockPayment, cfg.RegistrationInviteCode, cfg.InitialBalanceTokens, cfg.ModelCatalog)
+	h := handler.NewHandler(db, billingEngine, upstreamRouter, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin, cfg.RegistrationInviteCode, cfg.InitialBalanceTokens, cfg.ModelCatalog, cfg.TokensPerCredit, cfg.MaxGrantCreditsPerOp)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.Recoverer)
 	r.Use(middleware.CORS(cfg.CORSOrigins))
-	r.Use(chimw.Timeout(35 * time.Second))
+	r.Use(chimw.Timeout(10 * time.Minute))
 
 	authLimiter := middleware.IPRateLimit(rdb, cfg.AuthRateLimitPerMin, time.Minute)
+	adminLimiter := middleware.IPRateLimit(rdb, 30, time.Minute)
 	r.With(authLimiter).Post("/api/register", h.Register)
 	r.With(authLimiter).Post("/api/login", h.Login)
-	r.Get("/api/plans", h.ListPlans)
 	r.Get("/api/models", h.ListModels)
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.JWTAuth(cfg.JWTSecret))
+		r.Get("/api/me", h.GetMe)
 		r.Get("/api/keys", h.ListAPIKeys)
 		r.Post("/api/keys", h.CreateAPIKey)
 		r.Delete("/api/keys/{id}", h.DisableAPIKey)
 		r.Get("/api/balance", h.GetBalance)
-		r.Get("/api/orders", h.ListOrders)
-		r.Post("/api/orders", h.CreateOrder)
-		r.Post("/api/orders/{id}/pay", h.PayOrder)
+		r.Get("/api/credits/ledger", h.ListMyLedger)
+		r.Get("/api/usage", h.ListUsage)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.JWTAuth(cfg.JWTSecret))
+		r.Use(middleware.RequireAdmin)
+		r.Use(adminLimiter)
+		r.Post("/api/admin/credits/grant", h.GrantCredits)
+		r.Post("/api/admin/credits/revoke", h.RevokeCredits)
+		r.Get("/api/admin/credits/operations", h.ListCreditOperations)
+		r.Get("/api/admin/users", h.ListAdminUsers)
+		r.Get("/api/admin/audit-logs", h.ListAuditLogs)
 	})
 	r.Post("/v1/chat/completions", h.Gateway)
 
@@ -114,7 +134,7 @@ func main() {
 		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 35 * time.Second,
+		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
 	}
 

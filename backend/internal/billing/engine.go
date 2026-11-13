@@ -2,372 +2,410 @@ package billing
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
-	"github.com/redis/go-redis/v9"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/lrs/llm-api-gateway/internal/metrics"
+	"github.com/lrs/llm-api-gateway/internal/model"
+)
+
+const (
+	defaultHoldTTL       = time.Hour
+	defaultSweepInterval = 5 * time.Minute
 )
 
 type Engine struct {
-	rdb          *redis.Client
-	db           *sqlx.DB
-	logger       *zap.Logger
-	compWg       sync.WaitGroup
-	closing      bool
-	closeMutex   sync.Mutex
-	stopCh       chan struct{}
-	syncInterval time.Duration
-	compInterval time.Duration
+	db            *sqlx.DB
+	logger        *zap.Logger
+	holdTTL       time.Duration
+	sweepInterval time.Duration
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	closeOnce     sync.Once
 }
 
-func NewEngine(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger) *Engine {
-	return NewEngineWithOptions(rdb, db, logger, 60*time.Second, 30*time.Second)
+func NewEngine(db *sqlx.DB, logger *zap.Logger) *Engine {
+	return NewEngineWithOptions(db, logger, defaultHoldTTL, defaultSweepInterval)
 }
 
-func NewEngineWithOptions(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger, syncInterval, compInterval time.Duration) *Engine {
+func NewEngineWithOptions(db *sqlx.DB, logger *zap.Logger, holdTTL, sweepInterval time.Duration) *Engine {
 	e := &Engine{
-		rdb:          rdb,
-		db:           db,
-		logger:       logger,
-		stopCh:       make(chan struct{}),
-		syncInterval: syncInterval,
-		compInterval: compInterval,
+		db:            db,
+		logger:        logger,
+		holdTTL:       holdTTL,
+		sweepInterval: sweepInterval,
+		stopCh:        make(chan struct{}),
 	}
-	e.compWg.Add(2)
-	go e.compensationWorker()
-	go e.balanceSyncWorker()
+	e.wg.Add(1)
+	go e.sweepWorker()
 	return e
 }
 
-func (e *Engine) compensationWorker() {
-	defer e.compWg.Done()
-	ticker := time.NewTicker(e.compInterval)
+func (e *Engine) sweepWorker() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(e.sweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			e.processCompensations(context.Background())
+			e.SweepExpiredHolds(context.Background())
 		case <-e.stopCh:
 			return
 		}
 	}
 }
 
-func (e *Engine) balanceSyncWorker() {
-	defer e.compWg.Done()
-	ticker := time.NewTicker(e.syncInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if err := e.SyncAll(context.Background()); err != nil {
-				e.logger.Error("balance sync failed", zap.Error(err))
-			}
-		case <-e.stopCh:
-			return
-		}
-	}
-}
-
-func (e *Engine) ShutdownCompensation() {
-	e.closeMutex.Lock()
-	if e.closing {
-		e.closeMutex.Unlock()
-		return
-	}
-	e.closing = true
-	e.closeMutex.Unlock()
-	close(e.stopCh)
-	e.compWg.Wait()
-}
-
-func (e *Engine) queueCompensation(ctx context.Context, userID, amount int64, usageID *int64, reason string) error {
-	_, err := e.db.ExecContext(ctx,
-		"INSERT INTO compensations (user_id, amount, usage_log_id, reason, status) VALUES (?, ?, ?, ?, 'pending')",
-		userID, amount, usageID, reason)
-	if err != nil {
-		e.logger.Error("queue compensation failed", zap.Int64("user_id", userID), zap.Error(err))
-	}
-	return err
-}
-
-func (e *Engine) processCompensations(ctx context.Context) {
-	var rows []struct {
-		ID         int64  `db:"id"`
-		UserID     int64  `db:"user_id"`
-		Amount     int64  `db:"amount"`
-		UsageLogID *int64 `db:"usage_log_id"`
-		Reason     string `db:"reason"`
-	}
-	if err := e.db.SelectContext(ctx, &rows,
-		"SELECT id, user_id, amount, usage_log_id, reason FROM compensations WHERE status = 'pending' ORDER BY id LIMIT 20"); err != nil {
-		e.logger.Error("load compensations failed", zap.Error(err))
-		return
-	}
-	for _, row := range rows {
-		key := fmt.Sprintf("balance:%d", row.UserID)
-		if err := e.rdb.IncrBy(ctx, key, row.Amount).Err(); err != nil {
-			e.db.ExecContext(ctx, "UPDATE compensations SET attempts = attempts + 1, last_error = ?, status = CASE WHEN attempts + 1 >= 10 THEN 'failed' ELSE 'pending' END WHERE id = ?", err.Error(), row.ID)
-			e.logger.Error("compensation refund failed", zap.Int64("id", row.ID), zap.Error(err))
-			continue
-		}
-		bal, _ := e.rdb.Get(ctx, key).Int64()
-		if _, err := e.db.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id) VALUES (?, 'refund', ?, ?, ?)", row.UserID, row.Amount, bal, row.UsageLogID); err != nil {
-			e.db.ExecContext(ctx, "UPDATE compensations SET attempts = attempts + 1, last_error = ? WHERE id = ?", err.Error(), row.ID)
-			e.logger.Error("compensation log insert failed", zap.Int64("id", row.ID), zap.Error(err))
-			continue
-		}
-		e.db.ExecContext(ctx, "UPDATE compensations SET status = 'done', last_error = NULL WHERE id = ?", row.ID)
-		e.logger.Info("compensation refund completed", zap.Int64("id", row.ID), zap.Int64("user_id", row.UserID), zap.Int64("amount", row.Amount))
-	}
-}
-
-func (e *Engine) SyncAll(ctx context.Context) error {
-	var cursor uint64
-	for {
-		keys, next, err := e.rdb.Scan(ctx, cursor, "balance:*", 100).Result()
-		if err != nil {
-			return err
-		}
-		for _, key := range keys {
-			var userID int64
-			if _, err := fmt.Sscanf(key, "balance:%d", &userID); err == nil && userID > 0 {
-				if err := e.SyncToDB(ctx, userID); err != nil {
-					e.logger.Error("failed to sync balance", zap.Int64("user_id", userID), zap.Error(err))
-				}
-			}
-		}
-		cursor = next
-		if cursor == 0 {
-			return nil
-		}
-	}
+func (e *Engine) Close(ctx context.Context) {
+	e.closeOnce.Do(func() { close(e.stopCh) })
+	e.wg.Wait()
 }
 
 func (e *Engine) CheckBalance(ctx context.Context, userID int64) (int64, error) {
-	key := fmt.Sprintf("balance:%d", userID)
-	bal, err := e.rdb.Get(ctx, key).Int64()
-	if err == redis.Nil {
-		var balance int64
-		err = e.db.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ?", userID)
-		if err != nil {
-			return 0, err
-		}
-		ok, err := e.rdb.SetNX(ctx, key, balance, 0).Result()
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return e.rdb.Get(ctx, key).Int64()
-		}
-		return balance, nil
-	}
-	return bal, err
-}
-
-var reserveScript = redis.NewScript(`
-	local bal = redis.call('GET', KEYS[1])
-	if not bal then bal = 0 end
-	bal = tonumber(bal)
-	if bal < tonumber(ARGV[1]) then
-		return -1
-	end
-	redis.call('DECRBY', KEYS[1], ARGV[1])
-	return bal - tonumber(ARGV[1])
-`)
-
-// ReserveWithIdempotency rejects a repeated request ID before reserving tokens.
-// The key is scoped by user and expires after 10 minutes.
-func (e *Engine) ReserveWithIdempotency(ctx context.Context, userID int64, estimatedTokens int64, requestID string) error {
-	if requestID != "" {
-		idemKey := fmt.Sprintf("idem:%d:%s", userID, requestID)
-		ok, err := e.rdb.SetNX(ctx, idemKey, "1", 10*time.Minute).Result()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return ErrDuplicateRequest
-		}
-		if err := e.Reserve(ctx, userID, estimatedTokens); err != nil {
-			e.rdb.Del(ctx, idemKey)
-			return err
-		}
-		return nil
-	}
-	return e.Reserve(ctx, userID, estimatedTokens)
-}
-
-func (e *Engine) Reserve(ctx context.Context, userID int64, estimatedTokens int64) error {
 	timer := prometheus.NewTimer(metrics.BalanceCheckDuration)
 	defer timer.ObserveDuration()
 
+	var balance int64
+	err := e.db.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ?", userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return balance, err
+}
+
+func (e *Engine) ensureBalanceRow(ctx context.Context, userID int64) error {
+	_, err := e.db.ExecContext(ctx, "INSERT IGNORE INTO balances (user_id, balance) VALUES (?, 0)", userID)
+	return err
+}
+
+// ReserveWithIdempotency locks the balance row, deducts the estimate and
+// records a hold. The hold is what makes settlement and release idempotent.
+func (e *Engine) ReserveWithIdempotency(ctx context.Context, userID, estimatedTokens int64, requestID string) error {
+	if requestID == "" {
+		return ErrInvalidRequestID
+	}
 	if estimatedTokens <= 0 {
 		estimatedTokens = 1
 	}
-	key := fmt.Sprintf("balance:%d", userID)
-	exists, err := e.rdb.Exists(ctx, key).Result()
-	if err != nil {
-		e.logger.Error("balance cache check failed", zap.Int64("user_id", userID), zap.Error(err))
+	if err := e.ensureBalanceRow(ctx, userID); err != nil {
 		return err
 	}
-	if exists == 0 {
-		if _, err := e.CheckBalance(ctx, userID); err != nil {
-			e.logger.Error("load balance from db failed", zap.Int64("user_id", userID), zap.Error(err))
-			return err
-		}
-	}
-	result, err := reserveScript.Run(ctx, e.rdb, []string{key}, estimatedTokens).Int64()
-	if err != nil {
-		e.logger.Error("reserve failed", zap.Int64("user_id", userID), zap.Error(err))
-		return err
-	}
-	if result < 0 {
-		metrics.InsufficientBalance.Inc()
-		return ErrInsufficientBalance
-	}
-	return nil
-}
-
-func (e *Engine) Settle(ctx context.Context, userID int64, estimatedTokens, actualTokens int64, usageID *int64, model string) error {
-	diff := estimatedTokens - actualTokens
-	key := fmt.Sprintf("balance:%d", userID)
-	if diff > 0 {
-		if err := e.rdb.IncrBy(ctx, key, diff).Err(); err != nil {
-			e.logger.Error("settle refund failed", zap.Int64("user_id", userID), zap.Error(err))
-			return err
-		}
-	} else if diff < 0 {
-		if err := e.rdb.DecrBy(ctx, key, -diff).Err(); err != nil {
-			e.logger.Error("settle charge failed", zap.Int64("user_id", userID), zap.Error(err))
-			return err
-		}
-	}
-
-	metrics.TokensConsumed.WithLabelValues(model).Add(float64(actualTokens))
 
 	tx, err := e.db.BeginTxx(ctx, nil)
 	if err != nil {
-		e.logger.Error("begin tx failed", zap.Error(err))
 		return err
 	}
-	bal, _ := e.rdb.Get(ctx, key).Int64()
-	_, err = tx.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id) VALUES (?, 'consume', ?, ?, ?)",
-		userID, -actualTokens, bal, usageID)
+	defer tx.Rollback()
+
+	var balance int64
+	if err := tx.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ? FOR UPDATE", userID); err != nil {
+		return err
+	}
+	if balance < estimatedTokens {
+		metrics.InsufficientBalance.Inc()
+		return ErrInsufficientBalance
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE balances SET balance = balance - ? WHERE user_id = ?", estimatedTokens, userID); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO balance_holds (request_id, user_id, amount, status, expires_at) VALUES (?, ?, ?, 'HELD', DATE_ADD(NOW(), INTERVAL ? SECOND))",
+		requestID, userID, estimatedTokens, int64(e.holdTTL.Seconds()))
 	if err != nil {
-		tx.Rollback()
-		e.logger.Error("balance log insert failed", zap.Int64("user_id", userID), zap.Error(err))
+		if isDuplicateKey(err) {
+			return ErrDuplicateRequest
+		}
 		return err
 	}
 	return tx.Commit()
 }
 
-// RefundWithCompensation refunds tokens synchronously; on failure, enqueues compensation.
-func (e *Engine) RefundWithCompensation(ctx context.Context, userID int64, amount int64, usageID *int64) error {
-	key := fmt.Sprintf("balance:%d", userID)
-	err := e.rdb.IncrBy(ctx, key, amount).Err()
-	if err != nil {
-		e.logger.Error("sync refund failed, enqueueing compensation",
-			zap.Int64("user_id", userID),
-			zap.Int64("amount", amount),
-			zap.Error(err))
-		if queueErr := e.queueCompensation(ctx, userID, amount, usageID, "refund"); queueErr != nil {
-			e.logger.Error("compensation could not be queued", zap.Int64("user_id", userID), zap.Error(queueErr))
-		}
-		return err
+// Settle converts a hold into a consume entry. A repeated call is a no-op.
+func (e *Engine) Settle(ctx context.Context, userID int64, requestID string, actualTokens int64, usageID *int64, modelName string) error {
+	if requestID == "" {
+		return ErrInvalidRequestID
+	}
+	if actualTokens < 0 {
+		actualTokens = 0
 	}
 
-	bal, _ := e.rdb.Get(ctx, key).Int64()
-	_, err = e.db.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id) VALUES (?, 'refund', ?, ?, ?)",
-		userID, amount, bal, usageID)
+	tx, err := e.db.BeginTxx(ctx, nil)
 	if err != nil {
-		e.logger.Error("refund balance log insert failed", zap.Int64("user_id", userID), zap.Error(err))
 		return err
 	}
+	defer tx.Rollback()
+
+	var balance int64
+	if err := tx.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ? FOR UPDATE", userID); err != nil {
+		return err
+	}
+	var hold struct {
+		ID     int64  `db:"id"`
+		Amount int64  `db:"amount"`
+		Status string `db:"status"`
+	}
+	err = tx.GetContext(ctx, &hold,
+		"SELECT id, amount, status FROM balance_holds WHERE user_id = ? AND request_id = ? FOR UPDATE",
+		userID, requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrHoldNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if hold.Status != "HELD" {
+		return nil
+	}
+
+	delta := hold.Amount - actualTokens
+	newBalance := balance + delta
+	if _, err := tx.ExecContext(ctx, "UPDATE balances SET balance = ? WHERE user_id = ?", newBalance, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE balance_holds SET status = 'SETTLED', settled_at = NOW() WHERE id = ?", hold.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id, reference_type, reference_id, reason) VALUES (?, 'consume', ?, ?, ?, 'balance_hold', ?, ?)",
+		userID, -actualTokens, newBalance, usageID, hold.ID, "usage_settle"); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	metrics.TokensConsumed.WithLabelValues(modelName).Add(float64(actualTokens))
 	return nil
 }
 
-func (e *Engine) Refund(ctx context.Context, userID int64, amount int64, usageID int64) error {
-	key := fmt.Sprintf("balance:%d", userID)
-	return e.rdb.IncrBy(ctx, key, amount).Err()
-}
+// Release returns a held amount to the user. A repeated call is a no-op.
+func (e *Engine) Release(ctx context.Context, userID int64, requestID string, usageID *int64, reason string) error {
+	if requestID == "" {
+		return ErrInvalidRequestID
+	}
+	if reason == "" {
+		reason = "released"
+	}
 
-func (e *Engine) Recharge(ctx context.Context, userID int64, amount int64) error {
-	key := fmt.Sprintf("balance:%d", userID)
-	exists, err := e.rdb.Exists(ctx, key).Result()
+	tx, err := e.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if exists == 0 {
-		var balance int64
-		err = e.db.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ?", userID)
-		if err != nil {
-			return err
+	defer tx.Rollback()
+
+	var balance int64
+	if err := tx.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ? FOR UPDATE", userID); err != nil {
+		return err
+	}
+	var hold struct {
+		ID     int64  `db:"id"`
+		Amount int64  `db:"amount"`
+		Status string `db:"status"`
+	}
+	err = tx.GetContext(ctx, &hold,
+		"SELECT id, amount, status FROM balance_holds WHERE user_id = ? AND request_id = ? FOR UPDATE",
+		userID, requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrHoldNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if hold.Status != "HELD" {
+		return nil
+	}
+
+	newBalance := balance + hold.Amount
+	if _, err := tx.ExecContext(ctx, "UPDATE balances SET balance = ? WHERE user_id = ?", newBalance, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE balance_holds SET status = 'RELEASED', settled_at = NOW() WHERE id = ?", hold.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id, reference_type, reference_id, reason) VALUES (?, 'refund', ?, ?, ?, 'balance_hold', ?, ?)",
+		userID, hold.Amount, newBalance, usageID, hold.ID, truncate(reason, 255)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type CreditChange struct {
+	OperatorID      int64
+	UserID          int64
+	DeltaTokens     int64
+	Reason          string
+	ClientRequestID string
+	Kind            string
+	IP              string
+	UserAgent       string
+}
+
+// ApplyCreditChange writes the operation, balance and audit log in one
+// transaction. Repeating the same client request returns the original op.
+func (e *Engine) ApplyCreditChange(ctx context.Context, in CreditChange) (*model.CreditOperation, error) {
+	if in.DeltaTokens == 0 {
+		return nil, ErrInvalidAmount
+	}
+	if in.ClientRequestID == "" {
+		return nil, ErrInvalidRequestID
+	}
+	if in.Kind == "" {
+		if in.DeltaTokens > 0 {
+			in.Kind = "GRANT"
+		} else {
+			in.Kind = "REVOKE"
 		}
-		if err := e.rdb.SetNX(ctx, key, balance, 0).Err(); err != nil {
-			return err
+	}
+
+	var exists int64
+	if err := e.db.GetContext(ctx, &exists, "SELECT id FROM users WHERE id = ?", in.UserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAccountNotFound
+		}
+		return nil, err
+	}
+	if err := e.ensureBalanceRow(ctx, in.UserID); err != nil {
+		return nil, err
+	}
+
+	tx, err := e.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var balance int64
+	if err := tx.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ? FOR UPDATE", in.UserID); err != nil {
+		return nil, err
+	}
+	if in.DeltaTokens < 0 && balance+in.DeltaTokens < 0 {
+		return nil, ErrNegativeBalance
+	}
+
+	before := balance
+	after := balance + in.DeltaTokens
+	opNo := newOpNo()
+	result, err := tx.ExecContext(ctx,
+		"INSERT INTO credit_operations (op_no, user_id, kind, delta_tokens, balance_before, balance_after, reason, operator_id, client_request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		opNo, in.UserID, in.Kind, in.DeltaTokens, before, after, truncate(in.Reason, 255), in.OperatorID, in.ClientRequestID)
+	if err != nil {
+		if isDuplicateKey(err) {
+			tx.Rollback()
+			return e.operationByRequest(ctx, in.OperatorID, in.ClientRequestID)
+		}
+		return nil, err
+	}
+	opID, err := result.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE balances SET balance = ? WHERE user_id = ?", after, in.UserID); err != nil {
+		return nil, err
+	}
+	logType := strings.ToLower(in.Kind)
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO balance_logs (user_id, type, amount, balance_after, reference_type, reference_id, operator_id, reason) VALUES (?, ?, ?, ?, 'credit_operation', ?, ?, ?)",
+		in.UserID, logType, in.DeltaTokens, after, opID, in.OperatorID, truncate(in.Reason, 255)); err != nil {
+		return nil, err
+	}
+
+	detail, _ := json.Marshal(map[string]interface{}{
+		"op_no":          opNo,
+		"kind":           in.Kind,
+		"delta_tokens":   in.DeltaTokens,
+		"balance_before": before,
+		"balance_after":  after,
+		"reason":         in.Reason,
+	})
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO admin_audit_logs (actor_id, action, target_type, target_id, request_id, ip, user_agent, detail) VALUES (?, ?, 'user', ?, ?, ?, ?, ?)",
+		in.OperatorID, "credit."+logType, in.UserID, in.ClientRequestID, truncate(in.IP, 64), truncate(in.UserAgent, 255), detail); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return &model.CreditOperation{
+		ID:              opID,
+		OpNo:            opNo,
+		UserID:          in.UserID,
+		Kind:            in.Kind,
+		DeltaTokens:     in.DeltaTokens,
+		BalanceBefore:   before,
+		BalanceAfter:    after,
+		Reason:          in.Reason,
+		OperatorID:      in.OperatorID,
+		ClientRequestID: in.ClientRequestID,
+		CreatedAt:       time.Now(),
+	}, nil
+}
+
+func (e *Engine) operationByRequest(ctx context.Context, operatorID int64, requestID string) (*model.CreditOperation, error) {
+	var op model.CreditOperation
+	err := e.db.GetContext(ctx, &op,
+		"SELECT id, op_no, user_id, kind, delta_tokens, balance_before, balance_after, reason, operator_id, client_request_id, created_at FROM credit_operations WHERE operator_id = ? AND client_request_id = ?",
+		operatorID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	return &op, nil
+}
+
+func (e *Engine) SweepExpiredHolds(ctx context.Context) {
+	var rows []struct {
+		UserID    int64  `db:"user_id"`
+		RequestID string `db:"request_id"`
+	}
+	if err := e.db.SelectContext(ctx, &rows,
+		"SELECT user_id, request_id FROM balance_holds WHERE status = 'HELD' AND expires_at < NOW() ORDER BY id LIMIT 100"); err != nil {
+		e.logger.Error("load expired holds failed", zap.Error(err))
+		return
+	}
+	for _, row := range rows {
+		if err := e.Release(ctx, row.UserID, row.RequestID, nil, "hold_expired"); err != nil && !errors.Is(err, ErrHoldNotFound) {
+			e.logger.Error("release expired hold failed",
+				zap.Int64("user_id", row.UserID),
+				zap.String("request_id", row.RequestID),
+				zap.Error(err))
 		}
 	}
-	if err := e.rdb.IncrBy(ctx, key, amount).Err(); err != nil {
-		return err
-	}
-
-	bal, _ := e.rdb.Get(ctx, key).Int64()
-	_, err = e.db.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after) VALUES (?, 'recharge', ?, ?)",
-		userID, amount, bal)
-	return err
 }
 
-func (e *Engine) SyncToDB(ctx context.Context, userID int64) error {
-	key := fmt.Sprintf("balance:%d", userID)
-	bal, err := e.rdb.Get(ctx, key).Int64()
-	if err != nil {
-		return err
-	}
-	_, err = e.db.ExecContext(ctx, "UPDATE balances SET balance = ? WHERE user_id = ?", bal, userID)
-	if err != nil {
-		return err
-	}
-	e.logger.Info("synced balance to db", zap.Int64("user_id", userID), zap.Int64("balance", bal))
-	return nil
-}
-
-// Reconcile compares Redis balance with MySQL computed balance for a user.
-// Returns the drift (redis - mysql). Zero means consistent.
 func (e *Engine) Reconcile(ctx context.Context, userID int64) (int64, error) {
-	key := fmt.Sprintf("balance:%d", userID)
-	redisBal, err := e.rdb.Get(ctx, key).Int64()
-	if err != nil {
+	var balance int64
+	if err := e.db.GetContext(ctx, &balance, "SELECT balance FROM balances WHERE user_id = ?", userID); err != nil {
 		return 0, err
 	}
-
-	var mysqlBal int64
-	err = e.db.GetContext(ctx, &mysqlBal, "SELECT balance FROM balances WHERE user_id = ?", userID)
-	if err != nil {
+	var ledger int64
+	if err := e.db.GetContext(ctx, &ledger, "SELECT COALESCE(SUM(amount), 0) FROM balance_logs WHERE user_id = ?", userID); err != nil {
 		return 0, err
 	}
-
-	drift := redisBal - mysqlBal
-	if drift != 0 {
-		e.logger.Warn("balance drift detected",
-			zap.Int64("user_id", userID),
-			zap.Int64("redis_balance", redisBal),
-			zap.Int64("mysql_balance", mysqlBal),
-			zap.Int64("drift", drift))
-	}
-	return drift, nil
+	return balance - ledger, nil
 }
 
-func (e *Engine) Close(ctx context.Context) {
-	e.logger.Info("syncing all balances to db before shutdown")
-	if err := e.SyncAll(ctx); err != nil {
-		e.logger.Error("failed to sync balances", zap.Error(err))
+func newOpNo() string {
+	return "CR" + time.Now().Format("20060102150405") + strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", "")[:8])
+}
+
+func isDuplicateKey(err error) bool {
+	var mysqlErr *mysqlDriver.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
+
+func truncate(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
 	}
-	e.ShutdownCompensation()
+	return string(runes[:max])
 }
