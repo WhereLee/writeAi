@@ -39,12 +39,12 @@ func NewEngine(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger) *Engine {
 		logger:    logger,
 		compQueue: make(chan CompensateItem, 1000),
 	}
+	e.compWg.Add(1)
 	go e.compensationWorker()
 	return e
 }
 
 func (e *Engine) compensationWorker() {
-	e.compWg.Add(1)
 	defer e.compWg.Done()
 	for item := range e.compQueue {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
