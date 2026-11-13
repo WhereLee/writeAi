@@ -102,7 +102,9 @@ jobs:
             compose="docker compose -f docker-compose.server.yml"
             prev=$(cat DEPLOYED_SHA 2>/dev/null || true)
 
-            timeout 180 $compose pull server
+            if ! docker image inspect "ghcr.io/wherelee/llm-api-gateway:$IMAGE_TAG" >/dev/null 2>&1; then
+              timeout -k 10 180 $compose pull server
+            fi
             if systemctl is-active --quiet llm-server; then
               systemctl disable --now llm-server
             fi
