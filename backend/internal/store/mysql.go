@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"time"
@@ -21,6 +23,23 @@ func NewMySQL(dsn string) (*sqlx.DB, error) {
 }
 
 func Migrate(db *sqlx.DB) error {
+	ctx := context.Background()
+	conn, err := db.Connx(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var locked sql.NullInt64
+	if err := conn.GetContext(ctx, &locked, "SELECT GET_LOCK('llm_gateway_migrate', 30)"); err != nil {
+		return err
+	}
+	if !locked.Valid || locked.Int64 != 1 {
+		return fmt.Errorf("could not acquire migration lock")
+	}
+	defer func() {
+		_, _ = conn.ExecContext(ctx, "DO RELEASE_LOCK('llm_gateway_migrate')")
+	}()
+
 	queries := []string{
 		"CREATE TABLE IF NOT EXISTS users (id BIGINT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(64) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB",
 		"CREATE TABLE IF NOT EXISTS api_keys (id BIGINT AUTO_INCREMENT PRIMARY KEY, user_id BIGINT NOT NULL, `key` VARCHAR(64) NULL UNIQUE, key_hash CHAR(64) NULL, key_prefix VARCHAR(16) NULL, name VARCHAR(64) NOT NULL DEFAULT '', is_active BOOLEAN DEFAULT TRUE, expires_at TIMESTAMP NULL, last_used_at TIMESTAMP NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_user_id (user_id), UNIQUE KEY idx_key_hash (key_hash)) ENGINE=InnoDB",

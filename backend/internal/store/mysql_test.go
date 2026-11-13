@@ -41,10 +41,13 @@ func TestBackfillOpeningBalances(t *testing.T) {
 		db.Exec("DELETE FROM users WHERE id = ?", userID)
 	})
 
-	_, err = db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 1000)", userID)
+	tx, err := db.Beginx()
 	require.NoError(t, err)
-	_, err = db.Exec("INSERT INTO balance_logs (user_id, type, amount, balance_after, reason) VALUES (?, 'consume', 1200, 1000, 'old mismatch')", userID)
+	_, err = tx.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 1000)", userID)
 	require.NoError(t, err)
+	_, err = tx.Exec("INSERT INTO balance_logs (user_id, type, amount, balance_after, reason) VALUES (?, 'consume', 1200, 1000, 'old mismatch')", userID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 
 	require.NoError(t, Migrate(db))
 
@@ -74,10 +77,13 @@ func TestBackfillSkipsAlreadyConsistentLedger(t *testing.T) {
 		db.Exec("DELETE FROM users WHERE id = ?", userID)
 	})
 
-	_, err = db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 1000)", userID)
+	tx, err := db.Beginx()
 	require.NoError(t, err)
-	_, err = db.Exec("INSERT INTO balance_logs (user_id, type, amount, balance_after, reference_type, reference_id, reason) VALUES (?, 'grant', 1000, 1000, 'registration', ?, '注册赠送')", userID, userID)
+	_, err = tx.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 1000)", userID)
 	require.NoError(t, err)
+	_, err = tx.Exec("INSERT INTO balance_logs (user_id, type, amount, balance_after, reference_type, reference_id, reason) VALUES (?, 'grant', 1000, 1000, 'registration', ?, '注册赠送')", userID, userID)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 
 	require.NoError(t, Migrate(db))
 

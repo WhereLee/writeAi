@@ -34,7 +34,7 @@ jobs:
         env:
           TEST_MYSQL_DSN: "gateway:gateway123@tcp(127.0.0.1:3306)/llm_gateway?parseTime=true&charset=utf8mb4"
           REQUIRE_TEST_DB: "true"
-        run: go test ./... -v -count=1
+        run: go test ./... -v -count=1 -p 1
 
   race:
     runs-on: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
         env:
           TEST_MYSQL_DSN: "gateway:gateway123@tcp(127.0.0.1:3306)/llm_gateway?parseTime=true&charset=utf8mb4"
           REQUIRE_TEST_DB: "true"
-        run: go test -race ./... -count=1
+        run: go test -race ./... -count=1 -p 1
 
   build:
     runs-on: ubuntu-latest
