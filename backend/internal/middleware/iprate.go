@@ -10,8 +10,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// IPRateLimit applies a fixed-window limit per client IP. It trusts the first
-// X-Forwarded-For value because the service runs behind a local reverse proxy.
+// IPRateLimit applies a fixed-window limit per client IP. It trusts X-Real-IP
+// set by the local reverse proxy, falling back to the last X-Forwarded-For hop.
 func IPRateLimit(rdb *redis.Client, max int, window time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,9 +36,13 @@ func IPRateLimit(rdb *redis.Client, max int, window time.Duration) func(http.Han
 }
 
 func clientIP(r *http.Request) string {
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
-			return first
+		parts := strings.Split(forwarded, ",")
+		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+			return last
 		}
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
