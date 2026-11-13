@@ -27,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
                 labels.get("alertname", "alert"),
                 annotations.get("summary", ""),
             ))
-        text = "\n".join(lines) or "alertmanager test"
+        text = "[LLM] " + ("\n".join(lines) or "alertmanager test")
         if not WEBHOOK:
             self.send_response(503)
             self.end_headers()
