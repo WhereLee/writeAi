@@ -87,6 +87,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm test
 
   docker-build:
     runs-on: ubuntu-latest

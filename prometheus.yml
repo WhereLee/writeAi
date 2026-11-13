@@ -1,3 +1,6 @@
+rule_files:
+  - /etc/prometheus/llm-gateway-alerts.yml
+
 global:
   scrape_interval: 15s
 

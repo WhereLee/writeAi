@@ -34,7 +34,7 @@ cp frontend/.env.example frontend/.env
 ## API
 
 - `POST /api/register`, `POST /api/login`
-- `GET /api/plans` (public)
+- `GET /api/plans`, `GET /api/models` (public)
 - `GET /api/balance`, `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{id}` (JWT)
 - `GET /api/orders`, `POST /api/orders`, `POST /api/orders/{id}/pay` (JWT)
 - `POST /v1/chat/completions` (`X-API-Key`)
@@ -43,8 +43,12 @@ cp frontend/.env.example frontend/.env
 Order payment is a demo endpoint. It only works when
 `ALLOW_MOCK_PAYMENT=true`; keep it disabled in production.
 
+`/v1/chat/completions` supports `stream: true` for Server-Sent Events.
+API keys are stored as SHA-256 hashes; the full key is returned only once.
+Registration requires `REGISTRATION_INVITE_CODE` when that variable is set.
+
 `CORS_ORIGINS` is a comma-separated allowlist. Set it to the frontend origin,
-for example `http://118.31.111.223:3000`.
+for example `http://118.31.111.223:8080`.
 
 ## Deploy
 
@@ -58,9 +62,13 @@ host MySQL and Redis instances.
   the server with a health check and rollback.
 - Server deployment logic lives in `scripts/deploy.sh`: pull retries, lock,
   health check and rollback.
+- Production entrypoint is Nginx on `8080`: it serves `/opt/dist` and proxies
+  `/api/`, `/v1/`, `/healthz` and `/readyz` to `127.0.0.1:18080`.
+- `scripts/backup.sh` runs daily from `/etc/cron.d/llm-gateway-backup`.
+- Prometheus alert rules are in `prometheus-alerts.yml`.
 - Manual deploys: Actions -> CD -> Run workflow.
 - Required repository secrets: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`.
-- `SERVER_PASSWORD` is kept only as a fallback for password-based SSH.
+- SSH password authentication is disabled; CD uses `SERVER_SSH_KEY` only.
 - First-time server setup: copy `deploy/server.env.example` to
   `/opt/llm-gateway/server.env`, fill in real values, and `chmod 600` it.
 

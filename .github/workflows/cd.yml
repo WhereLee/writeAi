@@ -56,7 +56,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         env:
-          VITE_API_BASE: ${{ vars.VITE_API_BASE || 'http://118.31.111.223:8080' }}
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: |
           npm ci
           npm run build

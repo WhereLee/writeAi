@@ -1,0 +1,38 @@
+groups:
+  - name: llm-gateway
+    rules:
+      - alert: LLMGatewayDown
+        expr: up{job="llm-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM gateway is down"
+          description: "Prometheus cannot scrape the gateway for 2 minutes."
+
+      - alert: LLMGatewayUpstreamErrors
+        expr: sum(rate(llm_gateway_upstream_errors_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream error rate is elevated"
+          description: "Upstream errors are above 0.5/s for 5 minutes."
+
+      - alert: LLMGatewayRateLimited
+        expr: sum(rate(llm_gateway_rate_limited_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Many requests are being rate limited"
+          description: "Rate-limited requests are above 5/s for 5 minutes."
+
+      - alert: LLMGatewayInsufficientBalance
+        expr: sum(rate(llm_gateway_insufficient_balance_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Many requests are rejected for insufficient balance"
+          description: "Insufficient-balance rejections are above 1/s for 5 minutes."

@@ -8,8 +8,13 @@ services:
     env_file:
       - /opt/llm-gateway/server.env
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18080/healthz"]
       interval: 10s
       timeout: 3s
       retries: 6

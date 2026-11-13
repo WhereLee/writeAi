@@ -1,0 +1,383 @@
+openapi: 3.0.3
+info:
+  title: LLM API Gateway
+  version: 0.1.0
+  description: Token-billed LLM API gateway.
+servers:
+  - url: http://118.31.111.223:8080
+    description: Current HTTP entrypoint
+  - url: https://118-31-111-223.sslip.io
+    description: HTTPS entrypoint after TLS is enabled
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    RegisterRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+        password:
+          type: string
+          minLength: 6
+        invite_code:
+          type: string
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    Plan:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        token_amount:
+          type: integer
+        price_cents:
+          type: integer
+        discount_rate:
+          type: number
+    APIKey:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        key_prefix:
+          type: string
+        name:
+          type: string
+        is_active:
+          type: boolean
+        expires_at:
+          type: string
+          nullable: true
+        last_used_at:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+    Order:
+      type: object
+      properties:
+        id:
+          type: integer
+        user_id:
+          type: integer
+        plan_id:
+          type: integer
+        amount_cents:
+          type: integer
+        status:
+          type: string
+          enum: [pending, paying, paid, failed]
+        created_at:
+          type: string
+        paid_at:
+          type: string
+          nullable: true
+    ChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+        stream:
+          type: boolean
+          default: false
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role:
+                type: string
+              content:
+                type: string
+    ChatResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+paths:
+  /api/register:
+    post:
+      summary: Register a user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Created
+        '403':
+          description: Invalid invite code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many requests
+  /api/login:
+    post:
+      summary: Login and receive a JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: JWT issued
+        '401':
+          description: Invalid credentials
+        '429':
+          description: Too many requests
+  /api/plans:
+    get:
+      summary: List plans
+      responses:
+        '200':
+          description: Plans
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Plan'
+  /api/models:
+    get:
+      summary: List configured models
+      responses:
+        '200':
+          description: Model names
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+  /api/balance:
+    get:
+      summary: Get current balance
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Balance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id:
+                    type: integer
+                  balance:
+                    type: integer
+        '401':
+          description: Unauthorized
+  /api/keys:
+    get:
+      summary: List API keys
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Keys, without the full secret
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/APIKey'
+    post:
+      summary: Create an API key
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                expires_in_days:
+                  type: integer
+                  minimum: 0
+      responses:
+        '201':
+          description: Created; the full key is returned only once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  key:
+                    type: string
+                  key_prefix:
+                    type: string
+                  name:
+                    type: string
+  /api/keys/{id}:
+    delete:
+      summary: Disable an API key
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Disabled
+        '404':
+          description: Key not found for this user
+  /api/orders:
+    get:
+      summary: List current user's orders
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+    post:
+      summary: Create a pending order
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id]
+              properties:
+                plan_id:
+                  type: integer
+      responses:
+        '201':
+          description: Pending order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+  /api/orders/{id}/pay:
+    post:
+      summary: Pay a pending order (demo only)
+      description: Requires ALLOW_MOCK_PAYMENT=true.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Paid and credited
+        '403':
+          description: Mock payment disabled
+        '409':
+          description: Order is not pending
+  /v1/chat/completions:
+    post:
+      summary: Chat completion proxy
+      description: Set stream=true for Server-Sent Events.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: JSON response, or text/event-stream when stream=true
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          description: Invalid API key
+        '402':
+          description: Insufficient balance
+        '429':
+          description: Rate limited
+        '502':
+          description: Upstream error
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        '200':
+          description: ok
+  /readyz:
+    get:
+      summary: Readiness check
+      responses:
+        '200':
+          description: ready
+        '503':
+          description: MySQL or Redis not ready
