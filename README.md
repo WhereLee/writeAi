@@ -48,7 +48,7 @@ API keys are stored as SHA-256 hashes; the full key is returned only once.
 Registration requires `REGISTRATION_INVITE_CODE` when that variable is set.
 
 `CORS_ORIGINS` is a comma-separated allowlist. Set it to the frontend origin,
-for example `http://118.31.111.223:8080`.
+for example `https://118.31.111.223:8080`.
 
 ## Deploy
 
@@ -62,8 +62,8 @@ host MySQL and Redis instances.
   the server with a health check and rollback.
 - Server deployment logic lives in `scripts/deploy.sh`: pull retries, lock,
   health check and rollback.
-- Production entrypoint is Nginx on `8080`: it serves `/opt/dist` and proxies
-  `/api/`, `/v1/`, `/healthz` and `/readyz` to `127.0.0.1:18080`.
+- Production entrypoint is Nginx on `8080` with a self-signed certificate: it serves `/opt/dist` and proxies
+  `/api/`, `/v1/`, `/healthz` and `/readyz` to `127.0.0.1:18080`. Use `https://118.31.111.223:8080`; browsers will warn until you trust `llm-gateway.crt`, or use `curl -k`.
 - `scripts/backup.sh` runs daily from `/etc/cron.d/llm-gateway-backup`.
 - Prometheus alert rules are in `prometheus-alerts.yml`.
 - Manual deploys: Actions -> CD -> Run workflow.

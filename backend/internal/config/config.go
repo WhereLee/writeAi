@@ -40,7 +40,7 @@ func Load() (*Config, error) {
 		UpstreamURL:            getEnv("UPSTREAM_URL", ""),
 		UpstreamKey:            getEnv("UPSTREAM_KEY", ""),
 		RateLimitPerMin:        100,
-		CORSOrigins:            splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000,http://118.31.111.223:8080,https://118-31-111-223.sslip.io")),
+		CORSOrigins:            splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000,http://118.31.111.223:8080,https://118.31.111.223:8080,https://118-31-111-223.sslip.io")),
 		AllowMockPayment:       getEnv("ALLOW_MOCK_PAYMENT", "false") == "true",
 		RegistrationInviteCode: getEnv("REGISTRATION_INVITE_CODE", ""),
 		InitialBalanceTokens:   100000,

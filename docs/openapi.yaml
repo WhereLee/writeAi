@@ -4,10 +4,8 @@ info:
   version: 0.1.0
   description: Token-billed LLM API gateway.
 servers:
-  - url: http://118.31.111.223:8080
-    description: Current HTTP entrypoint
-  - url: https://118-31-111-223.sslip.io
-    description: HTTPS entrypoint after TLS is enabled
+  - url: https://118.31.111.223:8080
+    description: Self-signed HTTPS entrypoint
 
 components:
   securitySchemes:
