@@ -8,21 +8,23 @@ import (
 )
 
 type Config struct {
-	Port                   string
-	BindAddr               string
-	MySQLDSN               string
-	RedisAddr              string
-	JWTSecret              string
-	UpstreamURL            string
-	UpstreamKey            string
-	RateLimitPerMin        int
-	CORSOrigins            []string
-	AllowMockPayment       bool
-	RegistrationInviteCode string
-	InitialBalanceTokens   int64
-	AuthRateLimitPerMin    int
-	ModelCatalog           []string
-	ModelRoutes            map[string]ModelRoute
+	Port                    string
+	BindAddr                string
+	MySQLDSN                string
+	RedisAddr               string
+	JWTSecret               string
+	UpstreamURL             string
+	UpstreamKey             string
+	RateLimitPerMin         int
+	CORSOrigins             []string
+	RegistrationInviteCode  string
+	InitialBalanceTokens    int64
+	AuthRateLimitPerMin     int
+	ModelCatalog            []string
+	ModelRoutes             map[string]ModelRoute
+	TokensPerCredit         int64
+	MaxGrantCreditsPerOp    int64
+	BootstrapAdminUsernames []string
 }
 
 type ModelRoute struct {
@@ -32,21 +34,23 @@ type ModelRoute struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:                   getEnv("PORT", "8080"),
-		BindAddr:               getEnv("BIND_ADDR", ""),
-		MySQLDSN:               getEnv("MYSQL_DSN", ""),
-		RedisAddr:              getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		JWTSecret:              getEnv("JWT_SECRET", ""),
-		UpstreamURL:            getEnv("UPSTREAM_URL", ""),
-		UpstreamKey:            getEnv("UPSTREAM_KEY", ""),
-		RateLimitPerMin:        100,
-		CORSOrigins:            splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000,http://118.31.111.223:8080,https://118.31.111.223:8080,https://118-31-111-223.sslip.io")),
-		AllowMockPayment:       getEnv("ALLOW_MOCK_PAYMENT", "false") == "true",
-		RegistrationInviteCode: getEnv("REGISTRATION_INVITE_CODE", ""),
-		InitialBalanceTokens:   100000,
-		AuthRateLimitPerMin:    20,
-		ModelCatalog:           splitList(getEnv("MODEL_CATALOG", "deepseek-chat")),
-		ModelRoutes:            map[string]ModelRoute{},
+		Port:                    getEnv("PORT", "8080"),
+		BindAddr:                getEnv("BIND_ADDR", ""),
+		MySQLDSN:                getEnv("MYSQL_DSN", ""),
+		RedisAddr:               getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		JWTSecret:               getEnv("JWT_SECRET", ""),
+		UpstreamURL:             getEnv("UPSTREAM_URL", ""),
+		UpstreamKey:             getEnv("UPSTREAM_KEY", ""),
+		RateLimitPerMin:         100,
+		CORSOrigins:             splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000,http://118.31.111.223:8080,https://118.31.111.223:8080,https://118-31-111-223.sslip.io")),
+		RegistrationInviteCode:  getEnv("REGISTRATION_INVITE_CODE", ""),
+		InitialBalanceTokens:    100000,
+		AuthRateLimitPerMin:     20,
+		ModelCatalog:            splitList(getEnv("MODEL_CATALOG", "deepseek-chat")),
+		ModelRoutes:             map[string]ModelRoute{},
+		TokensPerCredit:         1000,
+		MaxGrantCreditsPerOp:    100000,
+		BootstrapAdminUsernames: splitList(getEnv("BOOTSTRAP_ADMIN_USERNAMES", "")),
 	}
 
 	if cfg.MySQLDSN == "" {
@@ -80,6 +84,20 @@ func Load() (*Config, error) {
 		fmt.Sscanf(v, "%d", &n)
 		if n > 0 {
 			cfg.AuthRateLimitPerMin = n
+		}
+	}
+	if v := os.Getenv("TOKENS_PER_CREDIT"); v != "" {
+		n := int64(0)
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			cfg.TokensPerCredit = n
+		}
+	}
+	if v := os.Getenv("MAX_GRANT_CREDITS_PER_OP"); v != "" {
+		n := int64(0)
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			cfg.MaxGrantCreditsPerOp = n
 		}
 	}
 	if v := os.Getenv("MODEL_ROUTES"); v != "" {

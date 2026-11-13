@@ -7,6 +7,11 @@ MODEL="${MODEL:-deepseek-chat}"
 USER_ID="${USER_ID:-2}"
 REDIS_SERVICE="${REDIS_SERVICE:-redis-server}"
 MYSQL_SERVICE="${MYSQL_SERVICE:-mysql}"
+MYSQL_CMD="${MYSQL_CMD:-mysql -N -B -u root -proot llm_gateway}"
+
+balance_of() {
+  $MYSQL_CMD -e "SELECT balance FROM balances WHERE user_id = $USER_ID"
+}
 
 need_key() {
   if [ -z "$API_KEY" ]; then
@@ -29,7 +34,7 @@ case "$scenario" in
   "upstream-timeout")
     need_key
     echo "=== Scenario: Upstream Timeout ==="
-    echo "Before: balance = $(redis-cli GET balance:$USER_ID)"
+    echo "Before: balance = $(balance_of)"
     target=$(dig +short api.deepseek.com | head -1)
     if [ -z "$target" ]; then
       echo "could not resolve api.deepseek.com" >&2
@@ -44,9 +49,9 @@ case "$scenario" in
     status=$(request_gateway)
     end=$(date +%s%N)
     echo "status=$status latency=$(( (end - start) / 1000000 ))ms"
-    echo "After: balance = $(redis-cli GET balance:$USER_ID)"
+    echo "After: balance = $(balance_of)"
     echo "Recovery status=$(request_gateway)"
-    echo "Final: balance = $(redis-cli GET balance:$USER_ID)"
+    echo "Final: balance = $(balance_of)"
     ;;
 
   "redis-down")
@@ -81,12 +86,12 @@ case "$scenario" in
   "concurrent-balance")
     need_key
     echo "=== Scenario: Concurrent Balance Check ==="
-    redis-cli SET "balance:$USER_ID" 20
+    $MYSQL_CMD -e "UPDATE balances SET balance = 20 WHERE user_id = $USER_ID"
     for i in 1 2 3 4 5; do
       (code=$(request_gateway); echo "$code") &
     done
     wait
-    echo "Final balance: $(redis-cli GET balance:$USER_ID)"
+    echo "Final balance: $(balance_of)"
     ;;
 
   "rate-limit")

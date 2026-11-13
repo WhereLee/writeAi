@@ -22,9 +22,10 @@ func newUUID() string {
 	return uuid.New().String()
 }
 
-func generateJWT(userID int64, secret string) (string, error) {
+func generateJWT(userID int64, role, secret string) (string, error) {
 	claims := &middleware.AuthClaims{
 		UserID: userID,
+		Role:   role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 		},

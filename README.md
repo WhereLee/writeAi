@@ -1,13 +1,13 @@
 # LLM API Gateway
 
-LLM API billing gateway: users purchase token credits, call LLM APIs through a unified endpoint, and are billed per actual token consumption.
+LLM API billing gateway: admins grant credits, users call LLM APIs through a unified endpoint, and are billed per actual token consumption.
 
 ## Architecture
 
 - **Go backend**: API gateway, billing engine, rate limiter
-- **React frontend**: User console (balance, API keys, plans)
-- **MySQL**: Users, orders, balance logs, usage logs
-- **Redis**: Balance cache, rate limiting, distributed locking
+- **React frontend**: User console (credits, API keys, ledger, usage) and admin console
+- **MySQL**: Users, balances, credit operations, balance logs, usage logs
+- **Redis**: Rate limiting
 
 ## Local Development
 
@@ -34,14 +34,29 @@ cp frontend/.env.example frontend/.env
 ## API
 
 - `POST /api/register`, `POST /api/login`
-- `GET /api/plans`, `GET /api/models` (public)
-- `GET /api/balance`, `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{id}` (JWT)
-- `GET /api/orders`, `POST /api/orders`, `POST /api/orders/{id}/pay` (JWT)
+- `GET /api/models` (public)
+- `GET /api/me`, `GET /api/balance`, `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{id}` (JWT)
+- `GET /api/credits/ledger`, `GET /api/usage` (JWT)
+- `POST /api/admin/credits/grant`, `POST /api/admin/credits/revoke` (admin)
+- `GET /api/admin/users`, `GET /api/admin/credits/operations`, `GET /api/admin/audit-logs` (admin)
 - `POST /v1/chat/completions` (`X-API-Key`)
 - `GET /healthz`, `GET /readyz`, `GET /metrics`
 
-Order payment is a demo endpoint. It only works when
-`ALLOW_MOCK_PAYMENT=true`; keep it disabled in production.
+Credits are the display unit of the token balance. `1 credit = TOKENS_PER_CREDIT`
+tokens (default 1000). All ledger entries are stored as integer tokens. Credits
+cannot be withdrawn, transferred, or exchanged for cash.
+
+Grant and revoke requests accept an `Idempotency-Key` header. Repeating the same
+key from the same admin returns the original operation without changing the
+balance again. Every admin action writes an audit log row in the same
+transaction.
+
+The first admin is promoted by setting `BOOTSTRAP_ADMIN_USERNAMES` to an existing
+username, or by running:
+
+```sql
+UPDATE users SET role = 'admin' WHERE username = '<name>';
+```
 
 `/v1/chat/completions` supports `stream: true` for Server-Sent Events.
 API keys are stored as SHA-256 hashes; the full key is returned only once.

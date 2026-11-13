@@ -8,7 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"math"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -26,21 +26,22 @@ import (
 )
 
 type Handler struct {
-	db               *sqlx.DB
-	billing          *billing.Engine
-	upstream         *upstream.Router
-	rateLimiter      *middleware.RateLimiter
-	jwtSecret        string
-	logger           *zap.Logger
-	rateLimitPerMin  int
-	allowMockPayment bool
-	inviteCode       string
-	initialBalance   int64
-	modelCatalog     []string
+	db              *sqlx.DB
+	billing         *billing.Engine
+	upstream        *upstream.Router
+	rateLimiter     *middleware.RateLimiter
+	jwtSecret       string
+	logger          *zap.Logger
+	rateLimitPerMin int
+	inviteCode      string
+	initialBalance  int64
+	modelCatalog    []string
+	tokensPerCredit int64
+	maxGrantCredits int64
 }
 
-func NewHandler(db *sqlx.DB, be *billing.Engine, uc *upstream.Router, rl *middleware.RateLimiter, jwtSecret string, logger *zap.Logger, rateLimitPerMin int, allowMockPayment bool, inviteCode string, initialBalance int64, modelCatalog []string) *Handler {
-	return &Handler{db: db, billing: be, upstream: uc, rateLimiter: rl, jwtSecret: jwtSecret, logger: logger, rateLimitPerMin: rateLimitPerMin, allowMockPayment: allowMockPayment, inviteCode: inviteCode, initialBalance: initialBalance, modelCatalog: modelCatalog}
+func NewHandler(db *sqlx.DB, be *billing.Engine, uc *upstream.Router, rl *middleware.RateLimiter, jwtSecret string, logger *zap.Logger, rateLimitPerMin int, inviteCode string, initialBalance int64, modelCatalog []string, tokensPerCredit, maxGrantCredits int64) *Handler {
+	return &Handler{db: db, billing: be, upstream: uc, rateLimiter: rl, jwtSecret: jwtSecret, logger: logger, rateLimitPerMin: rateLimitPerMin, inviteCode: inviteCode, initialBalance: initialBalance, modelCatalog: modelCatalog, tokensPerCredit: tokensPerCredit, maxGrantCredits: maxGrantCredits}
 }
 
 type registerReq struct {
@@ -69,13 +70,39 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	result, err := h.db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", req.Username, hash)
+	tx, err := h.db.BeginTxx(r.Context(), nil)
+	if err != nil {
+		h.logger.Error("begin register transaction failed", zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(r.Context(), "INSERT INTO users (username, password_hash) VALUES (?, ?)", req.Username, hash)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "username already exists"})
 		return
 	}
 	userID, _ := result.LastInsertId()
-	h.db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, ?)", userID, h.initialBalance)
+	if _, err := tx.ExecContext(r.Context(), "INSERT INTO balances (user_id, balance) VALUES (?, ?)", userID, h.initialBalance); err != nil {
+		h.logger.Error("create balance failed", zap.Int64("user_id", userID), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if h.initialBalance > 0 {
+		if _, err := tx.ExecContext(r.Context(),
+			"INSERT INTO balance_logs (user_id, type, amount, balance_after, reference_type, reference_id, reason) VALUES (?, 'grant', ?, ?, 'registration', ?, '注册赠送')",
+			userID, h.initialBalance, h.initialBalance, userID); err != nil {
+			h.logger.Error("write opening balance log failed", zap.Int64("user_id", userID), zap.Error(err))
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		h.logger.Error("commit register failed", zap.Int64("user_id", userID), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
 	h.logger.Info("user registered", zap.Int64("user_id", userID), zap.String("username", req.Username))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"user_id": userID, "username": req.Username})
 }
@@ -92,7 +119,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var user model.User
-	err := h.db.Get(&user, "SELECT id, username, password_hash FROM users WHERE username = ?", req.Username)
+	err := h.db.Get(&user, "SELECT id, username, password_hash, role FROM users WHERE username = ?", req.Username)
 	if err != nil {
 		h.logger.Warn("login failed", zap.String("username", req.Username), zap.Error(err))
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
@@ -102,13 +129,13 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
 	}
-	token, err := generateJWT(user.ID, h.jwtSecret)
+	token, err := generateJWT(user.ID, user.Role, h.jwtSecret)
 	if err != nil {
 		h.logger.Error("generate jwt failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"token": token, "user_id": user.ID})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"token": token, "user_id": user.ID, "role": user.Role})
 }
 
 type createKeyReq struct {
@@ -201,147 +228,59 @@ func (h *Handler) GetBalance(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"user_id": userID, "balance": bal})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"user_id":           userID,
+		"balance":           bal,
+		"tokens":            bal,
+		"credits":           h.formatCredits(bal),
+		"tokens_per_credit": h.tokensPerCredit,
+	})
 }
 
-func (h *Handler) ListPlans(w http.ResponseWriter, r *http.Request) {
-	var plans []model.Plan
-	err := h.db.Select(&plans, "SELECT id, name, token_amount, price_cents, discount_rate FROM plans")
-	if err != nil {
-		h.logger.Error("list plans failed", zap.Error(err))
+func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var user model.User
+	if err := h.db.GetContext(r.Context(), &user, "SELECT id, username, role, created_at FROM users WHERE id = ?", userID); err != nil {
+		h.logger.Error("get user failed", zap.Int64("user_id", userID), zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	writeJSON(w, http.StatusOK, plans)
+	bal, err := h.billing.CheckBalance(r.Context(), userID)
+	if err != nil {
+		h.logger.Error("get balance failed", zap.Int64("user_id", userID), zap.Error(err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"user_id":           user.ID,
+		"username":          user.Username,
+		"role":              user.Role,
+		"tokens":            bal,
+		"credits":           h.formatCredits(bal),
+		"tokens_per_credit": h.tokensPerCredit,
+	})
+}
+
+func (h *Handler) formatCredits(tokens int64) string {
+	if h.tokensPerCredit <= 0 {
+		return "0.00"
+	}
+	return fmt.Sprintf("%.2f", float64(tokens)/float64(h.tokensPerCredit))
 }
 
 func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.modelCatalog)
 }
 
-type createOrderReq struct {
-	PlanID int64 `json:"plan_id"`
-}
-
-func (h *Handler) CreateOrder(w http.ResponseWriter, r *http.Request) {
-	userID, ok := middleware.UserIDFromContext(r.Context())
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-
-	var req createOrderReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PlanID <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "plan_id is required"})
-		return
-	}
-
-	var plan model.Plan
-	if err := h.db.GetContext(r.Context(), &plan, "SELECT id, name, token_amount, price_cents, discount_rate FROM plans WHERE id = ?", req.PlanID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "plan not found"})
-		return
-	}
-
-	amountCents := int64(math.Round(float64(plan.PriceCents) * plan.DiscountRate))
-	result, err := h.db.ExecContext(r.Context(), "INSERT INTO orders (user_id, plan_id, amount_cents, status) VALUES (?, ?, ?, 'pending')", userID, plan.ID, amountCents)
-	if err != nil {
-		h.logger.Error("create order failed", zap.Int64("user_id", userID), zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-		return
-	}
-	orderID, _ := result.LastInsertId()
-
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id": orderID, "plan_id": plan.ID, "plan_name": plan.Name,
-		"token_amount": plan.TokenAmount, "amount_cents": amountCents, "status": "pending",
-	})
-}
-
-func (h *Handler) ListOrders(w http.ResponseWriter, r *http.Request) {
-	userID, ok := middleware.UserIDFromContext(r.Context())
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-
-	var orders []model.Order
-	err := h.db.SelectContext(r.Context(), &orders,
-		"SELECT id, user_id, plan_id, amount_cents, status, created_at, paid_at FROM orders WHERE user_id = ? ORDER BY id DESC",
-		userID)
-	if err != nil {
-		h.logger.Error("list orders failed", zap.Int64("user_id", userID), zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-		return
-	}
-	writeJSON(w, http.StatusOK, orders)
-}
-
-func (h *Handler) PayOrder(w http.ResponseWriter, r *http.Request) {
-	if !h.allowMockPayment {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "mock payment is disabled"})
-		return
-	}
-
-	userID, ok := middleware.UserIDFromContext(r.Context())
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	orderID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid order id"})
-		return
-	}
-
-	var order model.Order
-	if err := h.db.GetContext(r.Context(), &order, "SELECT id, user_id, plan_id, amount_cents, status FROM orders WHERE id = ? AND user_id = ?", orderID, userID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "order not found"})
-		return
-	}
-	if order.Status != "pending" {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "order is not pending"})
-		return
-	}
-
-	var plan model.Plan
-	if err := h.db.GetContext(r.Context(), &plan, "SELECT id, token_amount FROM plans WHERE id = ?", order.PlanID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "plan not found"})
-		return
-	}
-
-	claim, err := h.db.ExecContext(r.Context(), "UPDATE orders SET status = 'paying' WHERE id = ? AND user_id = ? AND status = 'pending'", order.ID, userID)
-	if err != nil {
-		h.logger.Error("claim order failed", zap.Int64("order_id", order.ID), zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-		return
-	}
-	if affected, _ := claim.RowsAffected(); affected == 0 {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "order is not pending"})
-		return
-	}
-
-	if err := h.billing.Recharge(r.Context(), userID, plan.TokenAmount); err != nil {
-		h.db.ExecContext(r.Context(), "UPDATE orders SET status = 'failed' WHERE id = ?", order.ID)
-		h.logger.Error("recharge failed", zap.Int64("order_id", order.ID), zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "recharge failed"})
-		return
-	}
-	if _, err := h.db.ExecContext(r.Context(), "UPDATE orders SET status = 'paid', paid_at = NOW() WHERE id = ?", order.ID); err != nil {
-		h.logger.Error("mark order paid failed", zap.Int64("order_id", order.ID), zap.Error(err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "order update failed"})
-		return
-	}
-
-	balance, _ := h.billing.CheckBalance(r.Context(), userID)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"order_id": order.ID, "status": "paid", "token_amount": plan.TokenAmount, "balance": balance,
-	})
-}
-
 type gatewayRequest struct {
-	Model    string             `json:"model"`
-	Messages []upstream.Message `json:"messages"`
-	Stream   bool               `json:"stream"`
+	Model     string             `json:"model"`
+	Messages  []upstream.Message `json:"messages"`
+	Stream    bool               `json:"stream"`
+	MaxTokens int64              `json:"max_tokens,omitempty"`
 }
 
 func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
@@ -395,8 +334,17 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 	for _, m := range req.Messages {
 		estimatedTokens += int64(len(m.Content)) / 4
 	}
+	if req.MaxTokens > 0 {
+		estimatedTokens += req.MaxTokens
+	} else {
+		estimatedTokens += 1024
+	}
+	requestID := r.Header.Get("X-Request-Id")
+	if requestID == "" {
+		requestID = newUUID()
+	}
 
-	if err := h.billing.ReserveWithIdempotency(r.Context(), ak.UserID, estimatedTokens, r.Header.Get("X-Request-Id")); err != nil {
+	if err := h.billing.ReserveWithIdempotency(r.Context(), ak.UserID, estimatedTokens, requestID); err != nil {
 		if err == billing.ErrDuplicateRequest {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "duplicate request"})
 			return
@@ -410,18 +358,20 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Stream {
-		h.streamGateway(w, r, ak, req, start, estimatedTokens)
+		h.streamGateway(w, r, ak, req, start, estimatedTokens, requestID)
 		return
 	}
 
-	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages}
+	settleCtx, cancel := settlementContext(r)
+	defer cancel()
+	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages, MaxTokens: req.MaxTokens}
 	resp, _, err := h.upstream.Chat(r.Context(), chatReq)
 	latencyMs := time.Since(start).Milliseconds()
 
 	if err != nil {
 		metrics.UpstreamErrors.WithLabelValues("error").Inc()
 		usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model, 0, 0, 0, 0, latencyMs, http.StatusBadGateway)
-		if err := h.billing.RefundWithCompensation(r.Context(), ak.UserID, estimatedTokens, usageID); err != nil {
+		if err := h.billing.Release(settleCtx, ak.UserID, requestID, usageID, "upstream_error"); err != nil {
 			h.logger.Error("refund failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(err))
 		}
 		metrics.RequestDuration.WithLabelValues(req.Model, strconv.Itoa(http.StatusBadGateway)).Observe(time.Since(start).Seconds())
@@ -434,7 +384,7 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 	usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model,
 		resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens, resp.Usage.TotalTokens,
 		latencyMs, http.StatusOK)
-	if err := h.billing.Settle(r.Context(), ak.UserID, estimatedTokens, actualTokens, usageID, req.Model); err != nil {
+	if err := h.billing.Settle(settleCtx, ak.UserID, requestID, actualTokens, usageID, req.Model); err != nil {
 		h.logger.Error("settle failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(err))
 	}
 
@@ -452,14 +402,16 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (h *Handler) streamGateway(w http.ResponseWriter, r *http.Request, ak model.APIKey, req gatewayRequest, start time.Time, estimatedTokens int64) {
-	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages}
+func (h *Handler) streamGateway(w http.ResponseWriter, r *http.Request, ak model.APIKey, req gatewayRequest, start time.Time, estimatedTokens int64, requestID string) {
+	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages, MaxTokens: req.MaxTokens}
 	body, _, err := h.upstream.ChatStream(r.Context(), chatReq)
 	latencyMs := time.Since(start).Milliseconds()
 	if err != nil {
 		metrics.UpstreamErrors.WithLabelValues("error").Inc()
-		usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model, 0, 0, 0, 0, latencyMs, http.StatusBadGateway)
-		if refundErr := h.billing.RefundWithCompensation(r.Context(), ak.UserID, estimatedTokens, usageID); refundErr != nil {
+		settleCtx, cancel := settlementContext(r)
+		defer cancel()
+		usageID := h.insertUsageLog(settleCtx, ak.UserID, ak.ID, req.Model, 0, 0, 0, 0, latencyMs, http.StatusBadGateway)
+		if refundErr := h.billing.Release(settleCtx, ak.UserID, requestID, usageID, "upstream_error"); refundErr != nil {
 			h.logger.Error("refund failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(refundErr))
 		}
 		metrics.RequestDuration.WithLabelValues(req.Model, strconv.Itoa(http.StatusBadGateway)).Observe(time.Since(start).Seconds())
@@ -498,13 +450,19 @@ func (h *Handler) streamGateway(w http.ResponseWriter, r *http.Request, ak model
 	if actualTokens <= 0 {
 		actualTokens = estimatedTokens
 	}
-	usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model,
+	settleCtx, cancel := settlementContext(r)
+	defer cancel()
+	usageID := h.insertUsageLog(settleCtx, ak.UserID, ak.ID, req.Model,
 		usage.PromptTokens, usage.CompletionTokens, actualTokens, actualTokens, latencyMs, http.StatusOK)
-	if err := h.billing.Settle(r.Context(), ak.UserID, estimatedTokens, actualTokens, usageID, req.Model); err != nil {
+	if err := h.billing.Settle(settleCtx, ak.UserID, requestID, actualTokens, usageID, req.Model); err != nil {
 		h.logger.Error("stream settle failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(err))
 	}
 	metrics.RequestDuration.WithLabelValues(req.Model, strconv.Itoa(http.StatusOK)).Observe(time.Since(start).Seconds())
 	h.logger.Info("gateway stream completed", zap.Int64("user_id", ak.UserID), zap.String("model", req.Model), zap.Int64("total_tokens", actualTokens), zap.Int64("latency_ms", latencyMs))
+}
+
+func settlementContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 }
 
 func parseSSEUsage(line string, usage *upstream.Usage) {
