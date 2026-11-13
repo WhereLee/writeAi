@@ -21,18 +21,18 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: ./backend
           push: true
@@ -44,12 +44,12 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -62,11 +62,11 @@ jobs:
           npm run build
 
       - name: Upload frontend
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
           source: frontend/dist
           target: /opt
           strip_components: 1
@@ -74,72 +74,37 @@ jobs:
           timeout: 60s
 
       - name: Upload compose file
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
           source: deploy/docker-compose.server.yml
           target: /opt/llm-gateway
           strip_components: 1
           overwrite: true
           timeout: 60s
 
-      - name: Pull and restart
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Upload deploy script
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
-          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: scripts/deploy.sh
+          target: /opt/llm-gateway
+          strip_components: 1
+          overwrite: true
           timeout: 60s
-          command_timeout: 5m
+
+      - name: Run deploy script
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          timeout: 60s
+          command_timeout: 15m
           script: |
-            set -eu
-            cd /opt/llm-gateway
-
-            IMAGE_TAG="${{ github.event.workflow_run.head_sha || github.sha }}"
-            export IMAGE_TAG
-            compose="docker compose -f docker-compose.server.yml"
-            prev=$(cat DEPLOYED_SHA 2>/dev/null || true)
-
-            if ! docker image inspect "ghcr.io/wherelee/llm-api-gateway:$IMAGE_TAG" >/dev/null 2>&1; then
-              timeout -k 10 180 $compose pull server
-            fi
-            if systemctl is-active --quiet llm-server; then
-              systemctl disable --now llm-server
-            fi
-
-            if ! $compose up -d server; then
-              echo "docker compose up failed"
-              $compose logs --tail=50 server || true
-              $compose down || true
-              systemctl enable --now llm-server || true
-              exit 1
-            fi
-
-            ok=0
-            for i in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
-                ok=1
-                break
-              fi
-              sleep 1
-            done
-
-            if [ "$ok" != "1" ]; then
-              echo "health check failed"
-              $compose logs --tail=50 server || true
-              if [ -n "$prev" ]; then
-                echo "rolling back to $prev"
-                export IMAGE_TAG="$prev"
-                $compose up -d server
-              else
-                $compose down || true
-                systemctl enable --now llm-server || true
-              fi
-              exit 1
-            fi
-
-            echo "$IMAGE_TAG" > DEPLOYED_SHA
-            $compose ps
-            echo "deployed $IMAGE_TAG"
+            chmod +x /opt/llm-gateway/deploy.sh
+            IMAGE_TAG="${{ github.event.workflow_run.head_sha || github.sha }}" /opt/llm-gateway/deploy.sh

@@ -22,8 +22,8 @@ jobs:
           --health-timeout=5s
           --health-retries=5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 'stable'
           cache-dependency-path: backend/go.sum
@@ -36,11 +36,40 @@ jobs:
           REQUIRE_TEST_DB: "true"
         run: go test ./... -v -count=1
 
+  race:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache-dependency-path: backend/go.sum
+      - name: Create database and user
+        run: mysql -h 127.0.0.1 -uroot -proot -e "CREATE DATABASE llm_gateway CHARACTER SET utf8mb4; CREATE USER IF NOT EXISTS gateway@'%' IDENTIFIED BY 'gateway123'; GRANT ALL ON llm_gateway.* TO gateway@'%'; FLUSH PRIVILEGES;"
+      - name: Run race tests
+        working-directory: backend
+        env:
+          TEST_MYSQL_DSN: "gateway:gateway123@tcp(127.0.0.1:3306)/llm_gateway?parseTime=true&charset=utf8mb4"
+          REQUIRE_TEST_DB: "true"
+        run: go test -race ./... -count=1
+
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 'stable'
           cache-dependency-path: backend/go.sum
@@ -50,7 +79,7 @@ jobs:
           go build ./...
           go vet ./...
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
       - name: Build frontend
@@ -62,7 +91,7 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build Docker image
         working-directory: backend
         run: docker build -t llm-api-gateway:latest .
