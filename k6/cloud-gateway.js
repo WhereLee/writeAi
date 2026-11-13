@@ -1,6 +1,8 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
 
+http.setResponseCallback(http.expectedStatuses(200, 429));
+
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 const API_KEY = __ENV.API_KEY || "";
 const MODEL = __ENV.MODEL || "deepseek-chat";

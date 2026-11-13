@@ -92,6 +92,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           password: ${{ secrets.SERVER_PASSWORD }}
           timeout: 60s
+          command_timeout: 5m
           script: |
             set -eu
             cd /opt/llm-gateway
@@ -101,7 +102,7 @@ jobs:
             compose="docker compose -f docker-compose.server.yml"
             prev=$(cat DEPLOYED_SHA 2>/dev/null || true)
 
-            $compose pull server
+            timeout 180 $compose pull server
             if systemctl is-active --quiet llm-server; then
               systemctl disable --now llm-server
             fi
