@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -78,7 +80,7 @@ func TestOrderPayFlow(t *testing.T) {
 	logger := zap.NewNop()
 	engine := billing.NewEngine(rdb, db, logger)
 	t.Cleanup(engine.ShutdownCompensation)
-	h := NewHandler(db, engine, upstream.NewClient("http://example.invalid", "mock", logger), middleware.NewRateLimiter(rdb), "test-secret", logger, 100, true)
+	h := NewHandler(db, engine, upstream.NewRouter("http://example.invalid", "mock", nil, logger), middleware.NewRateLimiter(rdb), "test-secret", logger, 100, true, "", 100000, []string{"deepseek-chat"})
 
 	r := chi.NewRouter()
 	r.Get("/api/plans", h.ListPlans)
@@ -87,8 +89,11 @@ func TestOrderPayFlow(t *testing.T) {
 		r.Get("/api/orders", h.ListOrders)
 		r.Post("/api/orders", h.CreateOrder)
 		r.Post("/api/orders/{id}/pay", h.PayOrder)
+		r.Get("/api/keys", h.ListAPIKeys)
+		r.Post("/api/keys", h.CreateAPIKey)
 		r.Delete("/api/keys/{id}", h.DisableAPIKey)
 	})
+	r.Post("/v1/chat/completions", h.Gateway)
 	token := handlerTestToken(t, userID, "test-secret")
 
 	create := httptest.NewRequest(http.MethodPost, "/api/orders", strings.NewReader(`{"plan_id":1}`))
@@ -124,7 +129,9 @@ func TestOrderPayFlow(t *testing.T) {
 	require.NoError(t, db.Get(&logs, "SELECT COUNT(*) FROM balance_logs WHERE user_id = ? AND type = 'recharge'", userID))
 	assert.Equal(t, 1, logs)
 
-	keyResult, err := db.Exec("INSERT INTO api_keys (user_id, `key`, name) VALUES (?, ?, ?)", userID, "sk-test-disable", "test")
+	fullKey := "sk-test-disable"
+	sum := sha256.Sum256([]byte(fullKey))
+	keyResult, err := db.Exec("INSERT INTO api_keys (user_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?)", userID, hex.EncodeToString(sum[:]), fullKey[:12], "test")
 	require.NoError(t, err)
 	keyID, err := keyResult.LastInsertId()
 	require.NoError(t, err)
@@ -136,4 +143,71 @@ func TestOrderPayFlow(t *testing.T) {
 	var active bool
 	require.NoError(t, db.Get(&active, "SELECT is_active FROM api_keys WHERE id = ?", keyID))
 	assert.False(t, active)
+
+	createKey := httptest.NewRequest(http.MethodPost, "/api/keys", strings.NewReader(`{"name":"gateway-test","expires_in_days":1}`))
+	createKey.Header.Set("Authorization", "Bearer "+token)
+	createKey.Header.Set("Content-Type", "application/json")
+	createKeyRec := httptest.NewRecorder()
+	r.ServeHTTP(createKeyRec, createKey)
+	require.Equal(t, http.StatusCreated, createKeyRec.Code, createKeyRec.Body.String())
+	var created struct {
+		ID        int64  `json:"id"`
+		Key       string `json:"key"`
+		KeyPrefix string `json:"key_prefix"`
+	}
+	require.NoError(t, json.Unmarshal(createKeyRec.Body.Bytes(), &created))
+	require.NotEmpty(t, created.Key)
+	require.NotEmpty(t, created.KeyPrefix)
+
+	chat := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-chat","messages":[{"role":"user","content":"hello"}]}`))
+	chat.Header.Set("X-API-Key", created.Key)
+	chat.Header.Set("Content-Type", "application/json")
+	chatRec := httptest.NewRecorder()
+	r.ServeHTTP(chatRec, chat)
+	require.Equal(t, http.StatusOK, chatRec.Code, chatRec.Body.String())
+
+	streamReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-chat","messages":[{"role":"user","content":"stream hello"}],"stream":true}`))
+	streamReq.Header.Set("X-API-Key", created.Key)
+	streamReq.Header.Set("Content-Type", "application/json")
+	streamRec := httptest.NewRecorder()
+	r.ServeHTTP(streamRec, streamReq)
+	require.Equal(t, http.StatusOK, streamRec.Code, streamRec.Body.String())
+	assert.Contains(t, streamRec.Body.String(), "data:")
+	assert.Contains(t, streamRec.Body.String(), "[DONE]")
+}
+
+func TestRegisterInviteCode(t *testing.T) {
+	db := handlerTestDB(t)
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	logger := zap.NewNop()
+	engine := billing.NewEngine(rdb, db, logger)
+	t.Cleanup(engine.ShutdownCompensation)
+	h := NewHandler(db, engine, upstream.NewRouter("http://example.invalid", "mock", nil, logger), middleware.NewRateLimiter(rdb), "test-secret", logger, 100, false, "invite-123", 1000, []string{"deepseek-chat"})
+
+	r := chi.NewRouter()
+	r.Post("/api/register", h.Register)
+	username := fmt.Sprintf("invite_%d", time.Now().UnixNano())
+
+	noInvite := httptest.NewRequest(http.MethodPost, "/api/register", strings.NewReader(fmt.Sprintf(`{"username":"%s","password":"testpass123"}`, username)))
+	noInvite.Header.Set("Content-Type", "application/json")
+	noInviteRec := httptest.NewRecorder()
+	r.ServeHTTP(noInviteRec, noInvite)
+	assert.Equal(t, http.StatusForbidden, noInviteRec.Code)
+
+	withInvite := httptest.NewRequest(http.MethodPost, "/api/register", strings.NewReader(fmt.Sprintf(`{"username":"%s","password":"testpass123","invite_code":"invite-123"}`, username)))
+	withInvite.Header.Set("Content-Type", "application/json")
+	withInviteRec := httptest.NewRecorder()
+	r.ServeHTTP(withInviteRec, withInvite)
+	require.Equal(t, http.StatusCreated, withInviteRec.Code, withInviteRec.Body.String())
+
+	var userID int64
+	require.NoError(t, db.Get(&userID, "SELECT id FROM users WHERE username = ?", username))
+	t.Cleanup(func() {
+		db.Exec("DELETE FROM balances WHERE user_id = ?", userID)
+		db.Exec("DELETE FROM users WHERE id = ?", userID)
+	})
+	var balance int64
+	require.NoError(t, db.Get(&balance, "SELECT balance FROM balances WHERE user_id = ?", userID))
+	assert.Equal(t, int64(1000), balance)
 }

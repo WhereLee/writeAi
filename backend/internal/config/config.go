@@ -1,34 +1,52 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 )
 
 type Config struct {
-	Port             string
-	MySQLDSN         string
-	RedisAddr        string
-	JWTSecret        string
-	UpstreamURL      string
-	UpstreamKey      string
-	RateLimitPerMin  int
-	CORSOrigins      []string
-	AllowMockPayment bool
+	Port                   string
+	BindAddr               string
+	MySQLDSN               string
+	RedisAddr              string
+	JWTSecret              string
+	UpstreamURL            string
+	UpstreamKey            string
+	RateLimitPerMin        int
+	CORSOrigins            []string
+	AllowMockPayment       bool
+	RegistrationInviteCode string
+	InitialBalanceTokens   int64
+	AuthRateLimitPerMin    int
+	ModelCatalog           []string
+	ModelRoutes            map[string]ModelRoute
+}
+
+type ModelRoute struct {
+	URL string `json:"url"`
+	Key string `json:"key"`
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:             getEnv("PORT", "8080"),
-		MySQLDSN:         getEnv("MYSQL_DSN", ""),
-		RedisAddr:        getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		JWTSecret:        getEnv("JWT_SECRET", ""),
-		UpstreamURL:      getEnv("UPSTREAM_URL", ""),
-		UpstreamKey:      getEnv("UPSTREAM_KEY", ""),
-		RateLimitPerMin:  100,
-		CORSOrigins:      splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000")),
-		AllowMockPayment: getEnv("ALLOW_MOCK_PAYMENT", "false") == "true",
+		Port:                   getEnv("PORT", "8080"),
+		BindAddr:               getEnv("BIND_ADDR", ""),
+		MySQLDSN:               getEnv("MYSQL_DSN", ""),
+		RedisAddr:              getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		JWTSecret:              getEnv("JWT_SECRET", ""),
+		UpstreamURL:            getEnv("UPSTREAM_URL", ""),
+		UpstreamKey:            getEnv("UPSTREAM_KEY", ""),
+		RateLimitPerMin:        100,
+		CORSOrigins:            splitList(getEnv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://118.31.111.223:3000,http://118.31.111.223:8080,https://118-31-111-223.sslip.io")),
+		AllowMockPayment:       getEnv("ALLOW_MOCK_PAYMENT", "false") == "true",
+		RegistrationInviteCode: getEnv("REGISTRATION_INVITE_CODE", ""),
+		InitialBalanceTokens:   100000,
+		AuthRateLimitPerMin:    20,
+		ModelCatalog:           splitList(getEnv("MODEL_CATALOG", "deepseek-chat")),
+		ModelRoutes:            map[string]ModelRoute{},
 	}
 
 	if cfg.MySQLDSN == "" {
@@ -48,6 +66,25 @@ func Load() (*Config, error) {
 		fmt.Sscanf(v, "%d", &n)
 		if n > 0 {
 			cfg.RateLimitPerMin = n
+		}
+	}
+	if v := os.Getenv("INITIAL_BALANCE_TOKENS"); v != "" {
+		n := int64(0)
+		fmt.Sscanf(v, "%d", &n)
+		if n >= 0 {
+			cfg.InitialBalanceTokens = n
+		}
+	}
+	if v := os.Getenv("AUTH_RATE_LIMIT_PER_MIN"); v != "" {
+		n := 0
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			cfg.AuthRateLimitPerMin = n
+		}
+	}
+	if v := os.Getenv("MODEL_ROUTES"); v != "" {
+		if err := json.Unmarshal([]byte(v), &cfg.ModelRoutes); err != nil {
+			return nil, fmt.Errorf("parse MODEL_ROUTES: %w", err)
 		}
 	}
 	return cfg, nil

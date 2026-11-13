@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -54,9 +55,13 @@ func main() {
 	log.Info("Redis connected")
 
 	billingEngine := billing.NewEngine(rdb, db, log)
-	upstreamClient := upstream.NewClient(cfg.UpstreamURL, cfg.UpstreamKey, log)
+	modelRoutes := make(map[string]upstream.Route, len(cfg.ModelRoutes))
+	for model, route := range cfg.ModelRoutes {
+		modelRoutes[model] = upstream.Route{URL: route.URL, Key: route.Key}
+	}
+	upstreamRouter := upstream.NewRouter(cfg.UpstreamURL, cfg.UpstreamKey, modelRoutes, log)
 	rateLimiter := middleware.NewRateLimiter(rdb)
-	h := handler.NewHandler(db, billingEngine, upstreamClient, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin, cfg.AllowMockPayment)
+	h := handler.NewHandler(db, billingEngine, upstreamRouter, rateLimiter, cfg.JWTSecret, log, cfg.RateLimitPerMin, cfg.AllowMockPayment, cfg.RegistrationInviteCode, cfg.InitialBalanceTokens, cfg.ModelCatalog)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
@@ -64,9 +69,11 @@ func main() {
 	r.Use(middleware.CORS(cfg.CORSOrigins))
 	r.Use(chimw.Timeout(35 * time.Second))
 
-	r.Post("/api/register", h.Register)
-	r.Post("/api/login", h.Login)
+	authLimiter := middleware.IPRateLimit(rdb, cfg.AuthRateLimitPerMin, time.Minute)
+	r.With(authLimiter).Post("/api/register", h.Register)
+	r.With(authLimiter).Post("/api/login", h.Login)
 	r.Get("/api/plans", h.ListPlans)
+	r.Get("/api/models", h.ListModels)
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.JWTAuth(cfg.JWTSecret))
 		r.Get("/api/keys", h.ListAPIKeys)
@@ -99,8 +106,12 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 
+	addr := ":" + cfg.Port
+	if cfg.BindAddr != "" {
+		addr = net.JoinHostPort(cfg.BindAddr, cfg.Port)
+	}
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
+		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 35 * time.Second,
@@ -123,27 +134,9 @@ func main() {
 	defer cancel()
 	srv.Shutdown(ctx)
 
-	// Get all user IDs from Redis and sync balances
-	userIDs := getUserIDsFromRedis(ctx, rdb)
-	billingEngine.Close(ctx, userIDs)
+	billingEngine.Close(ctx)
 
 	db.Close()
 	rdb.Close()
 	log.Info("shutdown complete")
-}
-
-func getUserIDsFromRedis(ctx context.Context, rdb *redis.Client) []int64 {
-	keys, err := rdb.Keys(ctx, "balance:*").Result()
-	if err != nil {
-		return nil
-	}
-	ids := make([]int64, 0, len(keys))
-	for _, key := range keys {
-		var id int64
-		fmt.Sscanf(key, "balance:%d", &id)
-		if id > 0 {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }

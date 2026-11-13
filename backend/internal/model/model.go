@@ -10,12 +10,15 @@ type User struct {
 }
 
 type APIKey struct {
-	ID        int64     `db:"id" json:"id"`
-	UserID    int64     `db:"user_id" json:"user_id"`
-	Key       string    `db:"key" json:"key"`
-	Name      string    `db:"name" json:"name"`
-	IsActive  bool      `db:"is_active" json:"is_active"`
-	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	ID         int64      `db:"id" json:"id"`
+	UserID     int64      `db:"user_id" json:"user_id"`
+	KeyHash    string     `db:"key_hash" json:"-"`
+	KeyPrefix  string     `db:"key_prefix" json:"key_prefix"`
+	Name       string     `db:"name" json:"name"`
+	IsActive   bool       `db:"is_active" json:"is_active"`
+	ExpiresAt  *time.Time `db:"expires_at" json:"expires_at"`
+	LastUsedAt *time.Time `db:"last_used_at" json:"last_used_at"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
 }
 
 type Balance struct {

@@ -1,11 +1,17 @@
 package handler
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,21 +28,25 @@ import (
 type Handler struct {
 	db               *sqlx.DB
 	billing          *billing.Engine
-	upstream         *upstream.Client
+	upstream         *upstream.Router
 	rateLimiter      *middleware.RateLimiter
 	jwtSecret        string
 	logger           *zap.Logger
 	rateLimitPerMin  int
 	allowMockPayment bool
+	inviteCode       string
+	initialBalance   int64
+	modelCatalog     []string
 }
 
-func NewHandler(db *sqlx.DB, be *billing.Engine, uc *upstream.Client, rl *middleware.RateLimiter, jwtSecret string, logger *zap.Logger, rateLimitPerMin int, allowMockPayment bool) *Handler {
-	return &Handler{db: db, billing: be, upstream: uc, rateLimiter: rl, jwtSecret: jwtSecret, logger: logger, rateLimitPerMin: rateLimitPerMin, allowMockPayment: allowMockPayment}
+func NewHandler(db *sqlx.DB, be *billing.Engine, uc *upstream.Router, rl *middleware.RateLimiter, jwtSecret string, logger *zap.Logger, rateLimitPerMin int, allowMockPayment bool, inviteCode string, initialBalance int64, modelCatalog []string) *Handler {
+	return &Handler{db: db, billing: be, upstream: uc, rateLimiter: rl, jwtSecret: jwtSecret, logger: logger, rateLimitPerMin: rateLimitPerMin, allowMockPayment: allowMockPayment, inviteCode: inviteCode, initialBalance: initialBalance, modelCatalog: modelCatalog}
 }
 
 type registerReq struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	InviteCode string `json:"invite_code"`
 }
 
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +57,10 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Username) < 3 || len(req.Password) < 6 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username must be 3+ chars, password 6+ chars"})
+		return
+	}
+	if h.inviteCode != "" && subtle.ConstantTimeCompare([]byte(req.InviteCode), []byte(h.inviteCode)) != 1 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid invite code"})
 		return
 	}
 	hash, err := hashPassword(req.Password)
@@ -61,7 +75,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID, _ := result.LastInsertId()
-	h.db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, 100000)", userID)
+	h.db.Exec("INSERT INTO balances (user_id, balance) VALUES (?, ?)", userID, h.initialBalance)
 	h.logger.Info("user registered", zap.Int64("user_id", userID), zap.String("username", req.Username))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"user_id": userID, "username": req.Username})
 }
@@ -98,7 +112,8 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 type createKeyReq struct {
-	Name string `json:"name"`
+	Name          string `json:"name"`
+	ExpiresInDays int    `json:"expires_in_days"`
 }
 
 func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -109,15 +124,23 @@ func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createKeyReq
 	json.NewDecoder(r.Body).Decode(&req)
-	key := "sk-" + newUUID()[:32]
-	result, err := h.db.Exec("INSERT INTO api_keys (user_id, `key`, name) VALUES (?, ?, ?)", userID, key, req.Name)
+	key := "sk-" + newUUID()
+	keyHash := hashAPIKey(key)
+	keyPrefix := key[:12]
+	var result sql.Result
+	var err error
+	if req.ExpiresInDays > 0 {
+		result, err = h.db.Exec("INSERT INTO api_keys (user_id, key_hash, key_prefix, name, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? DAY))", userID, keyHash, keyPrefix, req.Name, req.ExpiresInDays)
+	} else {
+		result, err = h.db.Exec("INSERT INTO api_keys (user_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?)", userID, keyHash, keyPrefix, req.Name)
+	}
 	if err != nil {
 		h.logger.Error("create api key failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 	keyID, _ := result.LastInsertId()
-	writeJSON(w, http.StatusCreated, map[string]interface{}{"id": keyID, "key": key, "name": req.Name})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"id": keyID, "key": key, "key_prefix": keyPrefix, "name": req.Name})
 }
 
 func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -127,13 +150,18 @@ func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var keys []model.APIKey
-	err := h.db.Select(&keys, "SELECT id, user_id, `key`, name, is_active, created_at FROM api_keys WHERE user_id = ?", userID)
+	err := h.db.Select(&keys, "SELECT id, user_id, key_prefix, name, is_active, expires_at, last_used_at, created_at FROM api_keys WHERE user_id = ?", userID)
 	if err != nil {
 		h.logger.Error("list api keys failed", zap.Error(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 	writeJSON(w, http.StatusOK, keys)
+}
+
+func hashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }
 
 func (h *Handler) DisableAPIKey(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +213,10 @@ func (h *Handler) ListPlans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, plans)
+}
+
+func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.modelCatalog)
 }
 
 type createOrderReq struct {
@@ -309,6 +341,7 @@ func (h *Handler) PayOrder(w http.ResponseWriter, r *http.Request) {
 type gatewayRequest struct {
 	Model    string             `json:"model"`
 	Messages []upstream.Message `json:"messages"`
+	Stream   bool               `json:"stream"`
 }
 
 func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
@@ -323,11 +356,13 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var ak model.APIKey
-	err := h.db.Get(&ak, "SELECT id, user_id, `key`, is_active FROM api_keys WHERE `key` = ? AND is_active = TRUE", apiKey)
+	keyHash := hashAPIKey(apiKey)
+	err := h.db.Get(&ak, "SELECT id, user_id, key_prefix, is_active, expires_at FROM api_keys WHERE key_hash = ? AND is_active = TRUE AND (expires_at IS NULL OR expires_at > NOW())", keyHash)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid or inactive API key"})
 		return
 	}
+	h.db.Exec("UPDATE api_keys SET last_used_at = NOW() WHERE id = ?", ak.ID)
 
 	allowed, err := h.rateLimiter.Limit(r.Context(), ak.UserID, h.rateLimitPerMin, time.Minute)
 	if err != nil {
@@ -374,6 +409,10 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
+	if req.Stream {
+		h.streamGateway(w, r, ak, req, start, estimatedTokens)
+		return
+	}
 
 	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages}
 	resp, _, err := h.upstream.Chat(r.Context(), chatReq)
@@ -411,6 +450,78 @@ func (h *Handler) Gateway(w http.ResponseWriter, r *http.Request) {
 	)
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) streamGateway(w http.ResponseWriter, r *http.Request, ak model.APIKey, req gatewayRequest, start time.Time, estimatedTokens int64) {
+	chatReq := &upstream.ChatRequest{Model: req.Model, Messages: req.Messages}
+	body, _, err := h.upstream.ChatStream(r.Context(), chatReq)
+	latencyMs := time.Since(start).Milliseconds()
+	if err != nil {
+		metrics.UpstreamErrors.WithLabelValues("error").Inc()
+		usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model, 0, 0, 0, 0, latencyMs, http.StatusBadGateway)
+		if refundErr := h.billing.RefundWithCompensation(r.Context(), ak.UserID, estimatedTokens, usageID); refundErr != nil {
+			h.logger.Error("refund failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(refundErr))
+		}
+		metrics.RequestDuration.WithLabelValues(req.Model, strconv.Itoa(http.StatusBadGateway)).Observe(time.Since(start).Seconds())
+		h.logger.Warn("upstream stream error", zap.Int64("user_id", ak.UserID), zap.String("model", req.Model), zap.Error(err))
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream error"})
+		return
+	}
+	defer body.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	var usage upstream.Usage
+	reader := bufio.NewReader(body)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			parseSSEUsage(line, &usage)
+			if _, writeErr := w.Write([]byte(line)); writeErr != nil {
+				break
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	actualTokens := usage.TotalTokens
+	if actualTokens <= 0 {
+		actualTokens = estimatedTokens
+	}
+	usageID := h.insertUsageLog(r.Context(), ak.UserID, ak.ID, req.Model,
+		usage.PromptTokens, usage.CompletionTokens, actualTokens, actualTokens, latencyMs, http.StatusOK)
+	if err := h.billing.Settle(r.Context(), ak.UserID, estimatedTokens, actualTokens, usageID, req.Model); err != nil {
+		h.logger.Error("stream settle failed", zap.Int64("user_id", ak.UserID), zap.Any("usage_log_id", usageID), zap.Error(err))
+	}
+	metrics.RequestDuration.WithLabelValues(req.Model, strconv.Itoa(http.StatusOK)).Observe(time.Since(start).Seconds())
+	h.logger.Info("gateway stream completed", zap.Int64("user_id", ak.UserID), zap.String("model", req.Model), zap.Int64("total_tokens", actualTokens), zap.Int64("latency_ms", latencyMs))
+}
+
+func parseSSEUsage(line string, usage *upstream.Usage) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if data == "" || data == "[DONE]" {
+		return
+	}
+	var chunk struct {
+		Usage *upstream.Usage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(data), &chunk); err == nil && chunk.Usage != nil {
+		*usage = *chunk.Usage
+	}
 }
 
 func (h *Handler) insertUsageLog(ctx context.Context, userID, apiKeyID int64, modelName string, promptTokens, completionTokens, totalTokens, costTokens, latencyMs int64, statusCode int) *int64 {

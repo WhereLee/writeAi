@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,9 +126,14 @@ func (c *Client) State() CircuitState {
 }
 
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type Message struct {
@@ -215,4 +221,53 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, htt
 	}
 	c.recordSuccess()
 	return &chatResp, resp.Header, nil
+}
+
+func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (io.ReadCloser, http.Header, error) {
+	if !c.canPass() {
+		metrics.UpstreamErrors.WithLabelValues("circuit_open").Inc()
+		return nil, nil, ErrCircuitOpen
+	}
+	if len(req.Messages) == 0 {
+		return nil, nil, fmt.Errorf("messages is required")
+	}
+
+	if c.mockMode {
+		contentLen := int64(len(req.Messages[0].Content))/4 + 1
+		total := contentLen + 10
+		stream := fmt.Sprintf(
+			"data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\",\"model\":%q,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello!\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":10,\"total_tokens\":%d}}\n\ndata: [DONE]\n\n",
+			req.Model, contentLen, total,
+		)
+		c.recordSuccess()
+		return io.NopCloser(strings.NewReader(stream)), nil, nil
+	}
+
+	req.Stream = true
+	req.StreamOptions = &StreamOptions{IncludeUsage: true}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		c.recordFailure()
+		metrics.UpstreamErrors.WithLabelValues("request_error").Inc()
+		return nil, nil, fmt.Errorf("upstream request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		c.recordFailure()
+		metrics.UpstreamErrors.WithLabelValues("upstream_error").Inc()
+		return nil, resp.Header, fmt.Errorf("upstream error status=%d body=%s", resp.StatusCode, string(body))
+	}
+	c.recordSuccess()
+	return resp.Body, resp.Header, nil
 }

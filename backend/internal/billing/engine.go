@@ -16,52 +16,63 @@ import (
 )
 
 type Engine struct {
-	rdb        *redis.Client
-	db         *sqlx.DB
-	logger     *zap.Logger
-	compQueue  chan CompensateItem
-	compWg     sync.WaitGroup
-	closing    bool
-	closeMutex sync.Mutex
-}
-
-type CompensateItem struct {
-	UserID int64
-	Amount int64
-	Model  string
-	Reason string // refund, settle
+	rdb          *redis.Client
+	db           *sqlx.DB
+	logger       *zap.Logger
+	compWg       sync.WaitGroup
+	closing      bool
+	closeMutex   sync.Mutex
+	stopCh       chan struct{}
+	syncInterval time.Duration
+	compInterval time.Duration
 }
 
 func NewEngine(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger) *Engine {
+	return NewEngineWithOptions(rdb, db, logger, 60*time.Second, 30*time.Second)
+}
+
+func NewEngineWithOptions(rdb *redis.Client, db *sqlx.DB, logger *zap.Logger, syncInterval, compInterval time.Duration) *Engine {
 	e := &Engine{
-		rdb:       rdb,
-		db:        db,
-		logger:    logger,
-		compQueue: make(chan CompensateItem, 1000),
+		rdb:          rdb,
+		db:           db,
+		logger:       logger,
+		stopCh:       make(chan struct{}),
+		syncInterval: syncInterval,
+		compInterval: compInterval,
 	}
-	e.compWg.Add(1)
+	e.compWg.Add(2)
 	go e.compensationWorker()
+	go e.balanceSyncWorker()
 	return e
 }
 
 func (e *Engine) compensationWorker() {
 	defer e.compWg.Done()
-	for item := range e.compQueue {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		key := fmt.Sprintf("balance:%d", item.UserID)
-		if item.Reason == "refund" {
-			if err := e.rdb.IncrBy(ctx, key, item.Amount).Err(); err != nil {
-				e.logger.Error("compensation refund failed",
-					zap.Int64("user_id", item.UserID),
-					zap.Int64("amount", item.Amount),
-					zap.Error(err))
-			} else {
-				e.logger.Info("compensation refund completed",
-					zap.Int64("user_id", item.UserID),
-					zap.Int64("amount", item.Amount))
-			}
+	ticker := time.NewTicker(e.compInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			e.processCompensations(context.Background())
+		case <-e.stopCh:
+			return
 		}
-		cancel()
+	}
+}
+
+func (e *Engine) balanceSyncWorker() {
+	defer e.compWg.Done()
+	ticker := time.NewTicker(e.syncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := e.SyncAll(context.Background()); err != nil {
+				e.logger.Error("balance sync failed", zap.Error(err))
+			}
+		case <-e.stopCh:
+			return
+		}
 	}
 }
 
@@ -73,8 +84,71 @@ func (e *Engine) ShutdownCompensation() {
 	}
 	e.closing = true
 	e.closeMutex.Unlock()
-	close(e.compQueue)
+	close(e.stopCh)
 	e.compWg.Wait()
+}
+
+func (e *Engine) queueCompensation(ctx context.Context, userID, amount int64, usageID *int64, reason string) error {
+	_, err := e.db.ExecContext(ctx,
+		"INSERT INTO compensations (user_id, amount, usage_log_id, reason, status) VALUES (?, ?, ?, ?, 'pending')",
+		userID, amount, usageID, reason)
+	if err != nil {
+		e.logger.Error("queue compensation failed", zap.Int64("user_id", userID), zap.Error(err))
+	}
+	return err
+}
+
+func (e *Engine) processCompensations(ctx context.Context) {
+	var rows []struct {
+		ID         int64  `db:"id"`
+		UserID     int64  `db:"user_id"`
+		Amount     int64  `db:"amount"`
+		UsageLogID *int64 `db:"usage_log_id"`
+		Reason     string `db:"reason"`
+	}
+	if err := e.db.SelectContext(ctx, &rows,
+		"SELECT id, user_id, amount, usage_log_id, reason FROM compensations WHERE status = 'pending' ORDER BY id LIMIT 20"); err != nil {
+		e.logger.Error("load compensations failed", zap.Error(err))
+		return
+	}
+	for _, row := range rows {
+		key := fmt.Sprintf("balance:%d", row.UserID)
+		if err := e.rdb.IncrBy(ctx, key, row.Amount).Err(); err != nil {
+			e.db.ExecContext(ctx, "UPDATE compensations SET attempts = attempts + 1, last_error = ?, status = CASE WHEN attempts + 1 >= 10 THEN 'failed' ELSE 'pending' END WHERE id = ?", err.Error(), row.ID)
+			e.logger.Error("compensation refund failed", zap.Int64("id", row.ID), zap.Error(err))
+			continue
+		}
+		bal, _ := e.rdb.Get(ctx, key).Int64()
+		if _, err := e.db.ExecContext(ctx, "INSERT INTO balance_logs (user_id, type, amount, balance_after, usage_log_id) VALUES (?, 'refund', ?, ?, ?)", row.UserID, row.Amount, bal, row.UsageLogID); err != nil {
+			e.db.ExecContext(ctx, "UPDATE compensations SET attempts = attempts + 1, last_error = ? WHERE id = ?", err.Error(), row.ID)
+			e.logger.Error("compensation log insert failed", zap.Int64("id", row.ID), zap.Error(err))
+			continue
+		}
+		e.db.ExecContext(ctx, "UPDATE compensations SET status = 'done', last_error = NULL WHERE id = ?", row.ID)
+		e.logger.Info("compensation refund completed", zap.Int64("id", row.ID), zap.Int64("user_id", row.UserID), zap.Int64("amount", row.Amount))
+	}
+}
+
+func (e *Engine) SyncAll(ctx context.Context) error {
+	var cursor uint64
+	for {
+		keys, next, err := e.rdb.Scan(ctx, cursor, "balance:*", 100).Result()
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			var userID int64
+			if _, err := fmt.Sscanf(key, "balance:%d", &userID); err == nil && userID > 0 {
+				if err := e.SyncToDB(ctx, userID); err != nil {
+					e.logger.Error("failed to sync balance", zap.Int64("user_id", userID), zap.Error(err))
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
 }
 
 func (e *Engine) CheckBalance(ctx context.Context, userID int64) (int64, error) {
@@ -203,13 +277,8 @@ func (e *Engine) RefundWithCompensation(ctx context.Context, userID int64, amoun
 			zap.Int64("user_id", userID),
 			zap.Int64("amount", amount),
 			zap.Error(err))
-		select {
-		case e.compQueue <- CompensateItem{UserID: userID, Amount: amount, Reason: "refund"}:
-			e.logger.Info("compensation queued", zap.Int64("user_id", userID), zap.Int64("amount", amount))
-		default:
-			e.logger.Error("compensation queue full, refund lost",
-				zap.Int64("user_id", userID),
-				zap.Int64("amount", amount))
+		if queueErr := e.queueCompensation(ctx, userID, amount, usageID, "refund"); queueErr != nil {
+			e.logger.Error("compensation could not be queued", zap.Int64("user_id", userID), zap.Error(queueErr))
 		}
 		return err
 	}
@@ -295,12 +364,10 @@ func (e *Engine) Reconcile(ctx context.Context, userID int64) (int64, error) {
 	return drift, nil
 }
 
-func (e *Engine) Close(ctx context.Context, activeUserIDs []int64) {
+func (e *Engine) Close(ctx context.Context) {
 	e.logger.Info("syncing all balances to db before shutdown")
-	for _, id := range activeUserIDs {
-		if err := e.SyncToDB(ctx, id); err != nil {
-			e.logger.Error("failed to sync balance", zap.Int64("user_id", id), zap.Error(err))
-		}
+	if err := e.SyncAll(ctx); err != nil {
+		e.logger.Error("failed to sync balances", zap.Error(err))
 	}
 	e.ShutdownCompensation()
 }
